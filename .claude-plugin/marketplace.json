@@ -1,10 +1,11 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "Square596",
   "owner": { "name": "Square596" },
   "plugins": [
     {
       "name": "remote-ssh-mcp",
-      "source": ".",
+      "source": "./plugins/remote-ssh-mcp",
       "description": "Work on a remote SSH host through a persistent, watchable tmux session."
     }
   ]
