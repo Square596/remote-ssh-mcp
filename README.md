@@ -41,7 +41,26 @@ on single-file reads. See [Limitations](#limitations).
 - `python3` on the **remote** host (used for atomic file writes via base64).
 - `uv` or `pipx` on your laptop.
 
+### As a Claude Code plugin (recommended)
+
+The plugin bundles the MCP server **and** the `/remote-server` skill that
+briefs the model on how to use it. Two slash commands inside any Claude
+Code session:
+
+```
+/plugin marketplace add Square596/remote-ssh-mcp
+/plugin install remote-ssh-mcp@Square596
+```
+
+The MCP server is launched via `uvx`, which downloads and caches the
+Python entrypoint on first run — no separate `pip install` step needed.
+
+To upgrade later: `uvx --refresh --from git+https://github.com/Square596/remote-ssh-mcp remote-ssh-mcp --help` (any `uvx` invocation with `--refresh` re-pulls).
+
 ### As an MCP server (any MCP client)
+
+If you don't want the skill or you're on a non-Claude-Code MCP client,
+install the Python package directly:
 
 ```bash
 uv tool install git+https://github.com/Square596/remote-ssh-mcp
@@ -65,17 +84,6 @@ Or with the Claude Code CLI:
 ```bash
 claude mcp add remote-ssh remote-ssh-mcp
 ```
-
-### As a Claude Code plugin (recommended)
-
-Bundles the MCP server **and** the `/remote-server` skill that briefs the
-model on how to use it:
-
-```bash
-claude plugin install Square596/remote-ssh-mcp
-```
-
-(Requires `uv` so the plugin can install the Python entrypoint.)
 
 ## Usage
 

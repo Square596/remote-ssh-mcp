@@ -1,0 +1,11 @@
+{
+  "name": "Square596",
+  "owner": { "name": "Square596" },
+  "plugins": [
+    {
+      "name": "remote-ssh-mcp",
+      "source": ".",
+      "description": "Work on a remote SSH host through a persistent, watchable tmux session."
+    }
+  ]
+}

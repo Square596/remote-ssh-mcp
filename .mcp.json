@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "remote-ssh": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Square596/remote-ssh-mcp",
+        "remote-ssh-mcp"
+      ]
+    }
+  }
+}
