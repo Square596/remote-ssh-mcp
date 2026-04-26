@@ -166,6 +166,27 @@ async def main(host: str) -> int:
         print(f"cwd_warning correctly set; cwd fell back to {bad.cwd}")
     await sm.disconnect(bad.connection_id)
 
+    step("stress: 20 rapid back-to-back small writes (sentinel-race regression)")
+    # The v0.1.2 race manifested when capture-pane saw END before BEGIN had
+    # propagated — most likely on the first write after a fresh window, but
+    # any rapid sequence increases the chance of catching it.
+    stress_failures = 0
+    for i in range(20):
+        try:
+            await write_remote_file(
+                conn.pane_id, f"/tmp/rsm_stress_{i}.txt", f"payload-{i}\n".encode()
+            )
+            data, _ = await read_remote_file(conn.pane_id, f"/tmp/rsm_stress_{i}.txt")
+            if data != f"payload-{i}\n".encode():
+                stress_failures += 1
+        except Exception as e:
+            stress_failures += 1
+            print(f"  iteration {i}: {type(e).__name__}: {str(e)[:120]}")
+    if stress_failures:
+        failures.append(f"{stress_failures}/20 stress iterations failed")
+    else:
+        print("stress OK (20/20 round-trips passed)")
+
     step("multi-line cmd is rejected by remote_run via server.py")
     # FastMCP exposes the underlying tool function via `.fn` on newer versions
     # and as the bare function on older versions; cope with both.

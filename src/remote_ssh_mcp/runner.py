@@ -122,7 +122,13 @@ async def run_in_pane(
         screen = await capture_pane(target)
         last_screen = screen
         m = end_re.search(screen)
-        if m:
+        if m and begin_re.search(screen[: m.start()]):
+            # Both sentinels are present — declare done. We *require* BEGIN
+            # before bailing, because tmux's grid is sometimes a tick behind
+            # the bytes streaming in: a single capture-pane call can show END
+            # while BEGIN hasn't yet propagated. Without this guard,
+            # _extract_output would fall back to the screen tail (banner +
+            # stale prior markers) and the caller would see a bogus stdout.
             exit_code = int(m.group(1))
             stdout = _extract_output(screen, begin_re, m.start())
             return RunResult(
@@ -135,13 +141,16 @@ async def run_in_pane(
 
 
 def _extract_output(screen: str, begin_re: re.Pattern[str], end_pos: int) -> str:
-    """Return content between the LAST BEGIN sentinel before end_pos and end_pos itself."""
+    """Return content between the LAST BEGIN sentinel before end_pos and end_pos itself.
+
+    The caller in run_in_pane guarantees BEGIN is present before invoking us,
+    so the no-match branch should be unreachable. We assert anyway — a bug in
+    the calling order would otherwise corrupt stdout silently, which is what
+    the v0.1.2 race-fix was for.
+    """
     upto_end = screen[:end_pos]
     matches = list(begin_re.finditer(upto_end))
-    if not matches:
-        # Sentinel discipline broken — return raw tail as a fallback so the
-        # caller has *something* to debug with.
-        return upto_end[-2000:].rstrip("\n")
+    assert matches, "_extract_output called without a BEGIN sentinel — caller bug"
     last_begin = matches[-1]
     output_start = last_begin.end()
     if output_start < len(screen) and screen[output_start] == "\n":
