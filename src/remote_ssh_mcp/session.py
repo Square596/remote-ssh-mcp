@@ -60,7 +60,16 @@ class SessionManager:
 
             await self._preflight(host)
 
-            ssh_cmd = f"ssh -A {shlex.quote(host)}"
+            # ServerAliveInterval keeps idle TCP connections from being torn
+            # down by middleboxes or aggressive remote configs — relevant when
+            # multiple subagents connect in parallel and one sits briefly idle
+            # between connect-completion and its first command.
+            ssh_cmd = (
+                f"ssh -A "
+                f"-o ServerAliveInterval=30 "
+                f"-o ServerAliveCountMax=3 "
+                f"{shlex.quote(host)}"
+            )
             if await self._session_exists(session):
                 window_id, pane_id = await self._new_window(session, label, ssh_cmd)
             else:
@@ -71,18 +80,34 @@ class SessionManager:
 
             cwd_warning: Optional[str] = None
             if project_path:
-                cd_result = await run_in_pane(
-                    pane_id, f"cd {shlex.quote(project_path)}", timeout=15
-                )
-                if cd_result.exit_code != 0:
+                cd_cmd = f"cd {shlex.quote(project_path)}"
+                cd_result = await run_in_pane(pane_id, cd_cmd, timeout=15)
+                # Retry once on timeout — the first paste after a fresh ssh
+                # is sometimes lost (agent-forwarding race, slow login script,
+                # or a transient network blip). A second attempt usually goes
+                # through. If it still times out, surface that cleanly rather
+                # than masquerading as a path-not-found.
+                if cd_result.timed_out:
+                    cd_result = await run_in_pane(pane_id, cd_cmd, timeout=15)
+                if cd_result.timed_out:
                     cwd_warning = (
-                        f"Failed to cd into project_path={project_path!r} "
-                        f"(rc={cd_result.exit_code}). Shell stderr/stdout:\n"
+                        f"Couldn't cd into project_path={project_path!r}: the "
+                        f"remote shell stopped responding (likely an SSH drop "
+                        f"or hung login script). Two attempts both timed out. "
+                        f"Try remote_disconnect then remote_connect to start a "
+                        f"fresh window. Last pane content:\n"
+                        f"{cd_result.stdout.strip()[:400]}"
+                    )
+                elif cd_result.exit_code != 0:
+                    cwd_warning = (
+                        f"cd into project_path={project_path!r} returned "
+                        f"rc={cd_result.exit_code} — the path likely doesn't "
+                        f"exist or you don't have access. Shell output:\n"
                         f"{cd_result.stdout.strip()[:400]}\n"
-                        f"The shell is now sitting in its login default directory "
-                        f"(usually $HOME), not the requested project. Tools that "
-                        f"depend on cwd (uv run, relative paths, project-scoped "
-                        f"configs) WILL behave wrong until this is fixed."
+                        f"The shell is now in its login default directory "
+                        f"(usually $HOME). Tools that depend on cwd (uv run, "
+                        f"relative paths, project-scoped configs) WILL behave "
+                        f"wrong until this is fixed."
                     )
 
             # Always capture the actual cwd so the agent knows where it is.

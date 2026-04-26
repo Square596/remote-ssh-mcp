@@ -156,14 +156,22 @@ async def main(host: str) -> int:
     else:
         print("isolation OK: parent in /tmp, sub in /var")
 
-    step("connect with bad project_path → cwd_warning surfaced")
+    step("connect with bad project_path → cwd_warning distinguishes rc≠0 from timeout")
     bad = await sm.connect(host=host, project_path="/no/such/dir/exists/here")
     if bad.cwd_warning is None:
         failures.append("expected cwd_warning for bad project_path, got None")
+    elif "rc=" not in bad.cwd_warning or "doesn't exist" not in bad.cwd_warning:
+        failures.append(
+            f"cwd_warning should describe a path-not-found (rc=...), got:\n{bad.cwd_warning!r}"
+        )
+    elif "timed out" in bad.cwd_warning:
+        failures.append(
+            "cwd_warning should NOT mention timeout for a real cd-failure case"
+        )
     elif bad.cwd == "?" or bad.cwd == "/no/such/dir/exists/here":
         failures.append(f"cwd should be the actual fallback (likely $HOME), got {bad.cwd!r}")
     else:
-        print(f"cwd_warning correctly set; cwd fell back to {bad.cwd}")
+        print(f"cwd_warning correctly identifies path-not-found; cwd fell back to {bad.cwd}")
     await sm.disconnect(bad.connection_id)
 
     step("stress: 20 rapid back-to-back small writes (sentinel-race regression)")

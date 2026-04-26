@@ -1,6 +1,6 @@
 [project]
 name = "remote-ssh-mcp"
-version = "0.1.2"
+version = "0.1.3"
 description = "MCP server that drives a persistent tmux+SSH session so Claude Code can work on a remote host transparently"
 readme = "README.md"
 requires-python = ">=3.10"
