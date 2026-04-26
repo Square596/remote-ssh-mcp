@@ -156,6 +156,27 @@ async def main(host: str) -> int:
     else:
         print("isolation OK: parent in /tmp, sub in /var")
 
+    step("connect with bad project_path → cwd_warning surfaced")
+    bad = await sm.connect(host=host, project_path="/no/such/dir/exists/here")
+    if bad.cwd_warning is None:
+        failures.append("expected cwd_warning for bad project_path, got None")
+    elif bad.cwd == "?" or bad.cwd == "/no/such/dir/exists/here":
+        failures.append(f"cwd should be the actual fallback (likely $HOME), got {bad.cwd!r}")
+    else:
+        print(f"cwd_warning correctly set; cwd fell back to {bad.cwd}")
+    await sm.disconnect(bad.connection_id)
+
+    step("multi-line cmd is rejected by remote_run via server.py")
+    # FastMCP exposes the underlying tool function via `.fn` on newer versions
+    # and as the bare function on older versions; cope with both.
+    from remote_ssh_mcp.server import remote_run as _rr
+    rr_callable = getattr(_rr, "fn", _rr)
+    res = await rr_callable(connection_id=conn.connection_id, cmd="echo a\necho b")
+    if res.get("ok") is not False or "multi-line" not in res.get("error", "").lower():
+        failures.append(f"expected multi-line rejection, got {res!r}")
+    else:
+        print("multi-line cmd rejected correctly")
+
     step("disconnect (sub then main)")
     await sm.disconnect(sub.connection_id)
     info = await sm.disconnect(conn.connection_id)

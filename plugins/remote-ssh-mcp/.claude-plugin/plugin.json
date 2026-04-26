@@ -1,6 +1,6 @@
 {
   "name": "remote-ssh-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Work on a remote SSH host through a persistent, watchable tmux session.",
   "author": { "name": "Square596" },
   "homepage": "https://github.com/Square596/remote-ssh-mcp",

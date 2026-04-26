@@ -38,6 +38,8 @@ class Connection:
     pane_id: str
     project_path: Optional[str]
     label: str
+    cwd: str = "?"
+    cwd_warning: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -67,13 +69,25 @@ class SessionManager:
             await self._configure_history(session)
             await self._wait_for_shell(pane_id, host)
 
+            cwd_warning: Optional[str] = None
             if project_path:
-                result = await run_in_pane(
+                cd_result = await run_in_pane(
                     pane_id, f"cd {shlex.quote(project_path)}", timeout=15
                 )
-                if result.exit_code != 0:
-                    # Don't fail the whole connect — let caller see the error and decide.
-                    pass
+                if cd_result.exit_code != 0:
+                    cwd_warning = (
+                        f"Failed to cd into project_path={project_path!r} "
+                        f"(rc={cd_result.exit_code}). Shell stderr/stdout:\n"
+                        f"{cd_result.stdout.strip()[:400]}\n"
+                        f"The shell is now sitting in its login default directory "
+                        f"(usually $HOME), not the requested project. Tools that "
+                        f"depend on cwd (uv run, relative paths, project-scoped "
+                        f"configs) WILL behave wrong until this is fixed."
+                    )
+
+            # Always capture the actual cwd so the agent knows where it is.
+            pwd_result = await run_in_pane(pane_id, "pwd", timeout=10)
+            cwd = pwd_result.stdout.strip() if pwd_result.exit_code == 0 else "?"
 
             conn_id = secrets.token_hex(6)
             conn = Connection(
@@ -84,6 +98,8 @@ class SessionManager:
                 pane_id=pane_id,
                 project_path=project_path,
                 label=label,
+                cwd=cwd,
+                cwd_warning=cwd_warning,
             )
             self._connections[conn_id] = conn
             return conn
@@ -260,6 +276,7 @@ class SessionManager:
                 "host": c.host,
                 "label": c.label,
                 "project_path": c.project_path,
+                "cwd": c.cwd,
                 "session_name": c.session_name,
                 "window_id": c.window_id,
             }

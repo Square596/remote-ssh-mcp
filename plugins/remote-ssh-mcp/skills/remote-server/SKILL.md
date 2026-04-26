@@ -19,7 +19,8 @@ Then call `remote_connect(host=<host>, project_path=<path>)`.
 
 - Save the returned `connection_id`. **Every** subsequent `remote_*` call needs it.
 - If the call returns `{ok: false, error: ...}`, surface the error verbatim. Don't retry blindly. Most errors are SSH config issues the user must fix locally.
-- Tell the user: `"Connected. You can watch with: tmux attach -t <session_name>"` (use the value from the response).
+- **Check `cwd_warning` in the response.** If non-null, the `cd` into `project_path` failed and the shell is in $HOME, not where the user asked. **Stop, paste the warning verbatim, and ask the user for the correct path** before doing anything else. Pressing on silently makes `uv run`, relative paths, and project-scoped configs all behave wrong (we've burned hours on this).
+- Tell the user: `"Connected to <host> at <cwd>. You can watch with: tmux attach -t <session_name>"`.
 
 ## Step 2 — Use only remote_* tools for the project
 
@@ -35,6 +36,13 @@ Then call `remote_connect(host=<host>, project_path=<path>)`.
 `remote_edit` has the same exact-string semantics as your local `Edit` — provide enough surrounding context for `old` to be unique, or pass `replace_all=true`.
 
 `remote_run` keeps shell state across calls: `cd`, `export`, `source venv/bin/activate`, `conda activate` all stick. Don't re-`cd` every call.
+
+**`remote_run` is single-line only.** Multi-line scripts and heredocs are rejected with an error pointing here. For multi-line content:
+- **Compound on one line:** chain with `;` or `&&`.
+- **Real scripts:** `remote_write` the script to a file, then `remote_run` to execute it.
+- **Heredocs:** same — write the document body via `remote_write` to a temp file, then redirect (`cmd < /tmp/foo`) or pipe (`cat /tmp/foo | cmd`).
+
+Don't try to "outsmart" this — the runner sends commands via tmux's paste-buffer which converts `\n` to CR mid-paste, and a multi-line command will wedge the shell at the `>` secondary prompt, requiring `remote_disconnect` to recover.
 
 You can still use `Read`/`Edit`/`Write` against **local** files (e.g. local notes, local git in another repo). The rule is: anything inside the remote project, go through `remote_*`.
 

@@ -40,6 +40,12 @@ async def remote_connect(
     optionally `cd` into `project_path`. Returns a `connection_id` to pass to all
     subsequent remote_* calls. Each call to remote_connect creates a fresh
     window — parent and subagents should each call remote_connect for isolation.
+
+    The response includes `cwd` (the actual current directory after the cd
+    attempt) and `cwd_warning` (non-null if `project_path` was provided but the
+    cd failed — the shell will be in $HOME or whatever default the login shell
+    sets). When cwd_warning is set, surface it to the user verbatim and stop —
+    don't proceed silently from $HOME.
     """
     try:
         conn = await sessions.connect(host=host, project_path=project_path, label=label)
@@ -49,6 +55,8 @@ async def remote_connect(
         connection_id=conn.connection_id,
         host=conn.host,
         project_path=conn.project_path,
+        cwd=conn.cwd,
+        cwd_warning=conn.cwd_warning,
         session_name=conn.session_name,
         label=conn.label,
         attach_hint=f"tmux attach -t {conn.session_name}",
@@ -71,9 +79,29 @@ async def remote_status() -> dict:
 
 @mcp.tool()
 async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
-    """Run a shell command in the persistent SSH session. Shell state (cwd, env,
-    activated venvs) is preserved across calls on the same connection_id.
-    Returns {ok, stdout, exit_code, duration_ms, timed_out}."""
+    """Run a SINGLE-LINE shell command in the persistent SSH session. Shell
+    state (cwd, env, activated venvs) is preserved across calls on the same
+    connection_id. Returns {ok, stdout, exit_code, duration_ms, timed_out}.
+
+    Multi-line scripts and heredocs are rejected — the runner sends commands
+    through the tmux paste-buffer which converts \\n to CR mid-paste, breaking
+    line continuation. For multi-line content, write a script with remote_write
+    then execute it with remote_run. For compound statements use ';' or '&&'
+    on a single line.
+    """
+    if "\n" in cmd or "\r" in cmd:
+        return _err(
+            "remote_run rejects multi-line commands. The tmux paste-buffer "
+            "converts newlines to CR mid-paste, which corrupts heredocs and "
+            "command continuation — the shell will wedge at the `>` "
+            "secondary prompt and require remote_disconnect to recover.\n\n"
+            "Workarounds:\n"
+            "  - Compound on one line:  cmd1 && cmd2 && cmd3\n"
+            "  - For multi-line scripts: remote_write the script to a file, "
+            "then remote_run to execute it.\n"
+            "  - For heredocs: same — write the document body via remote_write."
+        )
+
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
