@@ -6,7 +6,7 @@
     {
       "name": "remote-ssh-mcp",
       "source": "./plugins/remote-ssh-mcp",
-      "description": "Work on a remote SSH host through a persistent, watchable tmux session."
+      "description": "Let MCP-capable coding agents work on remote SSH hosts through persistent, watchable tmux sessions."
     }
   ]
 }

@@ -92,7 +92,11 @@ async def run_in_pane(
     marker = secrets.token_hex(8)
     begin_literal = f"__RSM_BEGIN_{marker}__"
     end_re = re.compile(rf"^__RSM_END_{re.escape(marker)}_(\d+)__\s*$", re.MULTILINE)
-    begin_re = re.compile(rf"^{re.escape(begin_literal)}\s*$", re.MULTILINE)
+    # The remote PTY can occasionally render the command echo and the first
+    # echo output on the same visual line. The expanded marker is still unique:
+    # the echoed command contains `${RSM_M}`, while real output contains the
+    # random marker value.
+    begin_re = re.compile(re.escape(begin_literal))
 
     # Strict single-line wrapping. Newlines in user_cmd would cause the paste
     # to be split into multiple shell lines, breaking sentinel ordering.

@@ -1,26 +1,26 @@
 # remote-ssh-mcp
 
-An MCP server that lets Claude Code work on a remote host through a persistent
-tmux+SSH session. Every tool call (run, read, write, edit, grep, glob) is
-routed through the same tmux pane on the remote, so you can `tmux attach` and
-watch the agent work in real time.
+An MCP server that lets coding agents work on a remote host through a
+persistent tmux+SSH session. Every tool call (run, read, write, edit, grep,
+glob) is routed through the same tmux pane on the remote, so you can
+`tmux attach` and watch the agent work in real time.
 
 ## Why
 
-Claude Code's built-in tools operate on the local filesystem and a fresh
+Most coding-agent clients operate on the local filesystem and a fresh
 non-interactive shell per call. That makes "I want the agent to work on my
-remote server" awkward — you end up wrapping every command in
-`ssh host '<cmd>'`, losing shell state (cwd, venv, env vars) between calls,
-and having no way to watch what's happening.
+remote server" awkward: you end up wrapping every command in `ssh host
+'<cmd>'`, losing shell state (cwd, venv, env vars) between calls, and having
+no way to watch what's happening.
 
 `remote-ssh-mcp` fixes that by:
 
 - Opening one persistent tmux session per remote host with `ssh -A` (agent
   forwarding) so the shell state sticks across calls.
-- Giving each Claude agent (parent + subagents) its own tmux **window**, so
+- Giving each agent (parent + subagents) its own tmux **window**, so
   parallel work doesn't race on the same shell.
 - Exposing a full toolkit (`remote_run`, `remote_read`, `remote_write`,
-  `remote_edit`, `remote_grep`, `remote_glob`, …) that mirrors Claude's local
+  `remote_edit`, `remote_grep`, `remote_glob`, …) that mirrors local agent
   tools — but every operation flows through the visible tmux pane.
 
 You can `tmux attach -t remote-ssh-mcp/<host>` at any time to watch.
@@ -36,16 +36,16 @@ on single-file reads. See [Limitations](#limitations).
 
 - `tmux` 3.0+ on your laptop.
 - An SSH config entry for the remote host (i.e. `ssh <host>` works in a normal
-  terminal). Agent forwarding will be requested via `ssh -A`; either configure
-  `ForwardAgent yes` for that `Host` or rely on `-A`.
+  terminal). Agent forwarding is requested via `ssh -A`, but a reachable local
+  ssh-agent is only required when you need forwarded-agent operations from the
+  remote host.
 - `python3` on the **remote** host (used for atomic file writes via base64).
 - `uv` or `pipx` on your laptop.
 
-### As a Claude Code plugin (recommended)
+### As a plugin with bundled skills
 
-The plugin bundles the MCP server **and** the `/remote-server` skill that
-briefs the model on how to use it. Two slash commands inside any Claude
-Code session:
+The plugin bundles the MCP server and skills that brief MCP-capable agents on
+how to use it. In Claude Code, install it with:
 
 ```
 /plugin marketplace add Square596/remote-ssh-mcp
@@ -59,15 +59,31 @@ To upgrade later: `uvx --refresh --from git+https://github.com/Square596/remote-
 
 ### As an MCP server (any MCP client)
 
-If you don't want the skill or you're on a non-Claude-Code MCP client,
-install the Python package directly:
+If you don't want the skill or you're on Codex, Cursor, or another MCP client,
+use the stdio server directly:
+
+```json
+{
+  "mcpServers": {
+    "remote-ssh": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/Square596/remote-ssh-mcp",
+        "remote-ssh-mcp"
+      ]
+    }
+  }
+}
+```
+
+You can also install the Python package directly:
 
 ```bash
 uv tool install git+https://github.com/Square596/remote-ssh-mcp
 ```
 
-Then add to your MCP client config. For Claude Code (`~/.claude/settings.json`
-or project `.claude/settings.json`):
+Then add the installed command to your MCP client config:
 
 ```json
 {
@@ -79,7 +95,7 @@ or project `.claude/settings.json`):
 }
 ```
 
-Or with the Claude Code CLI:
+For Claude Code CLI:
 
 ```bash
 claude mcp add remote-ssh remote-ssh-mcp
@@ -87,13 +103,15 @@ claude mcp add remote-ssh remote-ssh-mcp
 
 ## Usage
 
-Once installed, in a Claude Code session:
+Once installed, ask your agent to connect to a host with the `remote-ssh` skill
+or call the tool directly:
 
 ```
-/remote-server <host>
+remote_connect(host="<host>", project_path="/home/me/myproject")
 ```
 
-(or `/remote-server <host> /home/me/myproject` to skip the path prompt)
+Claude Code plugin users can also invoke `/remote-server <host>`; that skill
+name remains available for compatibility.
 
 `<host>` is whatever alias you use in `~/.ssh/config` — the same string
 that works for plain `ssh <host>`.
@@ -119,7 +137,7 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 
 | Tool | Local equivalent | Notes |
 |---|---|---|
-| `remote_connect(host, project_path?, label?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd}`. |
+| `remote_connect(host, project_path?, label?, require_agent_forwarding?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning}`. |
 | `remote_disconnect(connection_id)` | — | Closes window. Closes session if last window. |
 | `remote_status()` | — | Lists active connections. |
 | `remote_run(connection_id, cmd, timeout?)` | Bash | Persistent shell. Returns `{stdout, exit_code, duration_ms}`. |
@@ -133,9 +151,16 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 
 **`Couldn't connect to <host>`.** Check in this order:
 1. `ssh <host>` works in a regular terminal (host is in `~/.ssh/config`).
-2. `ssh-add -l` lists at least one key.
-3. The host allows agent forwarding (or you don't need it for what you're
-   doing — `-A` is requested but failing forwarding is non-fatal).
+2. The host supports non-interactive key-based auth (`BatchMode=yes`).
+3. If you need forwarded-agent operations from the remote host, `ssh-add -l`
+   lists at least one key and agent forwarding is allowed.
+
+**`agent_warning` is present.** The SSH connection worked, but the MCP server
+could not confirm a usable local ssh-agent. Normal remote commands can still
+work through `IdentityFile` or other OpenSSH config. Private git fetches from
+the remote that rely on forwarded agent keys may fail. Set
+`require_agent_forwarding=true` or `REMOTE_SSH_MCP_REQUIRE_AGENT=1` to make
+that condition fatal.
 
 **The pane gets noisy with base64 blobs.** Yes — that's the cost of routing
 file writes through the visible terminal. The skill prefixes blobs with a
