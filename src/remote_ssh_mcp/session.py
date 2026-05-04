@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import secrets
 import shlex
@@ -40,6 +41,7 @@ class Connection:
     label: str
     cwd: str = "?"
     cwd_warning: Optional[str] = None
+    agent_warning: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -53,12 +55,15 @@ class SessionManager:
         host: str,
         project_path: Optional[str] = None,
         label: Optional[str] = None,
+        require_agent_forwarding: bool = False,
     ) -> Connection:
         async with self._connect_lock:
             session = _session_name(host)
             label = label or f"agent-{secrets.token_hex(3)}"
 
-            await self._preflight(host)
+            agent_warning = await self._preflight(
+                host, require_agent_forwarding=require_agent_forwarding
+            )
 
             # ServerAliveInterval keeps idle TCP connections from being torn
             # down by middleboxes or aggressive remote configs — relevant when
@@ -125,28 +130,14 @@ class SessionManager:
                 label=label,
                 cwd=cwd,
                 cwd_warning=cwd_warning,
+                agent_warning=agent_warning,
             )
             self._connections[conn_id] = conn
             return conn
 
-    async def _preflight(self, host: str) -> None:
-        proc = await asyncio.create_subprocess_exec(
-            "ssh-add", "-l", stdout=subprocess.PIPE, stderr=subprocess.PIPE
-        )
-        _, _ = await proc.communicate()
-        if proc.returncode not in (0, 1):
-            # rc 0 = keys present, 1 = no keys, 2 = agent not running.
-            raise SessionError(
-                "ssh-agent not reachable. Start it (`eval $(ssh-agent)`) and "
-                "load a key with `ssh-add` before connecting."
-            )
-        if proc.returncode == 1:
-            raise SessionError(
-                "ssh-agent has no keys loaded. Run `ssh-add` (or "
-                "`ssh-add ~/.ssh/your_key`) and try again — agent forwarding "
-                "(`ssh -A`) requires loaded keys."
-            )
-
+    async def _preflight(
+        self, host: str, require_agent_forwarding: bool = False
+    ) -> Optional[str]:
         proc = await asyncio.create_subprocess_exec(
             "ssh",
             "-A",
@@ -170,6 +161,43 @@ class SessionManager:
                 f"  - Network unreachable / wrong port.\n\n"
                 f"Try `ssh {host}` in a regular terminal first. ssh said:\n{stderr}"
             )
+
+        strict_agent = require_agent_forwarding or os.environ.get(
+            "REMOTE_SSH_MCP_REQUIRE_AGENT", ""
+        ).lower() in {"1", "true", "yes", "on"}
+
+        proc = await asyncio.create_subprocess_exec(
+            "ssh-add", "-l", stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        _, err = await proc.communicate()
+        if proc.returncode == 0:
+            return None
+
+        if proc.returncode == 1:
+            warning = (
+                "Connected to the host, but ssh-agent has no keys loaded. "
+                "Remote commands will work if SSH auth used another method, "
+                "but forwarded-agent operations from the remote host, such as "
+                "private git fetches through your local agent, may fail. Run "
+                "`ssh-add` or call remote_connect with "
+                "`require_agent_forwarding=false` if forwarding is not needed."
+            )
+        else:
+            stderr = err.decode("utf-8", errors="replace").strip()
+            detail = f" ssh-add said: {stderr}" if stderr else ""
+            warning = (
+                "Connected to the host, but ssh-agent is not reachable from "
+                "the MCP server process. Remote commands will work if SSH auth "
+                "used another method, but forwarded-agent operations from the "
+                f"remote host may fail.{detail}"
+            )
+
+        if strict_agent:
+            raise SessionError(
+                f"SSH connection to {host!r} works, but agent forwarding was "
+                f"required and is not ready. {warning}"
+            )
+        return warning
 
     async def _session_exists(self, session: str) -> bool:
         rc, _, _ = await _tmux("has-session", "-t", f"={session}")
@@ -304,6 +332,7 @@ class SessionManager:
                 "cwd": c.cwd,
                 "session_name": c.session_name,
                 "window_id": c.window_id,
+                "agent_warning": c.agent_warning,
             }
             for c in self._connections.values()
         ]

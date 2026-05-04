@@ -35,6 +35,7 @@ async def remote_connect(
     host: str,
     project_path: Optional[str] = None,
     label: Optional[str] = None,
+    require_agent_forwarding: bool = False,
 ) -> dict:
     """Open a new tmux window on the per-host session, ssh -A into `host`, and
     optionally `cd` into `project_path`. Returns a `connection_id` to pass to all
@@ -46,9 +47,19 @@ async def remote_connect(
     cd failed — the shell will be in $HOME or whatever default the login shell
     sets). When cwd_warning is set, surface it to the user verbatim and stop —
     don't proceed silently from $HOME.
+
+    By default, SSH config authentication is enough to connect. If
+    `require_agent_forwarding` is true, the connection also requires a reachable
+    ssh-agent with loaded keys. The response includes `agent_warning` when the
+    host is reachable but forwarded-agent operations may fail.
     """
     try:
-        conn = await sessions.connect(host=host, project_path=project_path, label=label)
+        conn = await sessions.connect(
+            host=host,
+            project_path=project_path,
+            label=label,
+            require_agent_forwarding=require_agent_forwarding,
+        )
     except SessionError as e:
         return _err(str(e))
     return _ok(
@@ -57,6 +68,7 @@ async def remote_connect(
         project_path=conn.project_path,
         cwd=conn.cwd,
         cwd_warning=conn.cwd_warning,
+        agent_warning=conn.agent_warning,
         session_name=conn.session_name,
         label=conn.label,
         attach_hint=f"tmux attach -t {conn.session_name}",

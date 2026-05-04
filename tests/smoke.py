@@ -5,7 +5,9 @@ Run with:
 
 `<host>` must be reachable via `ssh -A <host>` non-interactively
 (BatchMode=yes) — i.e. configured in your ~/.ssh/config with key-based
-auth. Nothing is hardcoded; substitute whatever alias works for you.
+auth. A loaded ssh-agent is recommended for forwarded-agent operations, but
+not required unless you pass require_agent_forwarding=True. Nothing is
+hardcoded; substitute whatever alias works for you.
 """
 
 from __future__ import annotations
