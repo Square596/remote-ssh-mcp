@@ -16,7 +16,9 @@ class FakeProc:
         return b"", self._stderr
 
 
-def install_process_mock(monkeypatch: pytest.MonkeyPatch, results: list[FakeProc]) -> None:
+def install_process_mock(
+    monkeypatch: pytest.MonkeyPatch, results: list[FakeProc]
+) -> list[tuple[str, ...]]:
     calls: list[tuple[str, ...]] = []
 
     async def fake_create_subprocess_exec(*args, **kwargs):
@@ -29,12 +31,12 @@ def install_process_mock(monkeypatch: pytest.MonkeyPatch, results: list[FakeProc
         "remote_ssh_mcp.session.asyncio.create_subprocess_exec",
         fake_create_subprocess_exec,
     )
-    monkeypatch.setattr(fake_create_subprocess_exec, "calls", calls, raising=False)
+    return calls
 
 
 @pytest.mark.asyncio
 async def test_preflight_allows_identityfile_auth_without_agent(monkeypatch):
-    install_process_mock(
+    calls = install_process_mock(
         monkeypatch,
         [
             FakeProc(0),
@@ -45,7 +47,18 @@ async def test_preflight_allows_identityfile_auth_without_agent(monkeypatch):
     warning = await SessionManager()._preflight("mlspace")
 
     assert warning is not None
-    assert "ssh-agent is not reachable" in warning
+    assert "ssh-agent is not reachable from the remote shell" in warning
+    assert calls[1] == (
+        "ssh",
+        "-A",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+        "mlspace",
+        "ssh-add",
+        "-l",
+    )
 
 
 @pytest.mark.asyncio

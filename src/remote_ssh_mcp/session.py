@@ -167,7 +167,17 @@ class SessionManager:
         ).lower() in {"1", "true", "yes", "on"}
 
         proc = await asyncio.create_subprocess_exec(
-            "ssh-add", "-l", stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            "ssh",
+            "-A",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            host,
+            "ssh-add",
+            "-l",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         _, err = await proc.communicate()
         if proc.returncode == 0:
@@ -187,8 +197,8 @@ class SessionManager:
             detail = f" ssh-add said: {stderr}" if stderr else ""
             warning = (
                 "Connected to the host, but ssh-agent is not reachable from "
-                "the MCP server process. Remote commands will work if SSH auth "
-                "used another method, but forwarded-agent operations from the "
+                "the remote shell. Remote commands will work if SSH auth used "
+                "another method, but forwarded-agent operations from the "
                 f"remote host may fail.{detail}"
             )
 
