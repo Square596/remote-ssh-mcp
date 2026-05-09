@@ -24,14 +24,32 @@ Then call `remote_connect(host=<host>, project_path=<path>)`.
 - If the call returns `{ok: false, error: ...}`, surface the error verbatim. Do
   not retry blindly. Most errors are SSH config, authentication, or network
   issues the user must fix locally.
-- If `agent_warning` is non-null, tell the user that the SSH connection worked
-  but forwarded-agent operations from the remote host may fail. Continue unless
-  the user specifically needs remote commands to use their forwarded local SSH
-  agent.
-- If `cwd_warning` is non-null, the `cd` into `project_path` failed and the
-  shell is in `$HOME`, not where the user asked. Stop, paste the warning
-  verbatim, and ask the user for the correct path before doing anything else.
 - Tell the user: `"Connected to <host> at <cwd>. You can watch with: tmux attach -t <session_name>"`.
+- In the same message, always report SSH agent status from the structured
+  fields:
+  - `forwarded_agent_present=true`: "SSH agent: present on the remote."
+  - `forwarded_agent_present=false`: "SSH agent: not present or not accessible
+    from the remote."
+  - `forwarded_agent_present=null`: "SSH agent: forwarding disabled; not
+    checked."
+- Also report the key-path arguments passed to local `ssh-add`:
+  - If `agent_forwarding=false`: "SSH key paths added: none; ssh-add was not
+    run."
+  - If `ssh_add_paths=[]`: "SSH key paths added: none; used bare ssh-add."
+  - Otherwise list only the path strings from `ssh_add_paths`. Do not list
+    fingerprints, key comments, or raw `ssh-add -l` output.
+- If `ssh_add_exit_code` is non-zero, use `ssh_add_output` to summarize that
+  some requested key paths may be incorrect or failed to add. Tell the user to
+  check those paths and reconnect with corrected paths if those keys are
+  needed. Do not paste raw `ssh_add_output` unless it contains only path-based
+  errors.
+- If `agent_warning` is non-null, include it as the warning detail. Continue
+  unless the user specifically needs remote commands to use their forwarded
+  local SSH agent.
+- If `cwd_warning` is non-null, the `cd` into `project_path` failed and the
+  shell is in `$HOME`, not where the user asked. Stop after the connection and
+  agent-status message, paste the warning verbatim, and ask the user for the
+  correct path before doing anything else.
 
 ## Step 2 - Use only remote_* tools for the remote project
 

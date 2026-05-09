@@ -1,0 +1,27 @@
+{
+  "name": "remote-ssh-mcp",
+  "version": "0.2.0",
+  "description": "Let MCP-capable coding agents work on remote SSH hosts through persistent, watchable tmux sessions.",
+  "author": { "name": "Square596", "url": "https://github.com/Square596" },
+  "homepage": "https://github.com/Square596/remote-ssh-mcp",
+  "repository": "https://github.com/Square596/remote-ssh-mcp",
+  "license": "MIT",
+  "keywords": ["mcp", "codex", "claude", "ssh", "tmux", "remote"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Remote SSH MCP",
+    "shortDescription": "Work on remote SSH hosts through persistent tmux sessions.",
+    "longDescription": "Routes MCP file and shell operations through persistent, watchable tmux+SSH sessions so coding agents can work on remote hosts while preserving shell state.",
+    "developerName": "Square596",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/Square596/remote-ssh-mcp",
+    "defaultPrompt": [
+      "Work on my remote server.",
+      "Connect to my SSH host and inspect the project.",
+      "Use remote SSH tools for this codebase."
+    ],
+    "brandColor": "#2563EB"
+  }
+}

@@ -38,10 +38,14 @@ async def read_remote_file(
     pane_id: str, path: str, offset: int = 0, limit: int = MAX_READ_BYTES
 ) -> tuple[bytes, int]:
     """Read up to `limit` bytes starting at `offset`. Returns (data, total_size)."""
+    if offset < 0:
+        raise FileOpError("offset must be >= 0.")
+    if limit <= 0:
+        raise FileOpError("limit must be > 0.")
     if limit > MAX_READ_BYTES:
         raise FileOpError(
-            f"limit={limit} exceeds max {MAX_READ_BYTES}; chunked reads are not "
-            f"yet supported. Read the file in pieces using offset/limit."
+            f"limit={limit} exceeds max {MAX_READ_BYTES}; read larger files in "
+            f"pieces using offset/limit."
         )
 
     # Single-line python — must avoid block constructs (with/try/def/for) since
@@ -62,15 +66,15 @@ async def read_remote_file(
     await _comment(pane_id, f"remote-ssh-mcp: reading {path}")
     result = await run_in_pane(pane_id, cmd, timeout=120)
     if result.exit_code != 0:
-        raise FileOpError(f"remote read failed (rc={result.exit_code}): {result.stdout}")
+        raise FileOpError(
+            f"remote read failed (rc={result.exit_code}): {result.stdout}"
+        )
 
     out = result.stdout
     bi = out.find(_BIN_BEGIN)
     ei = out.find(_BIN_END)
     if bi == -1 or ei == -1 or ei < bi:
-        raise FileOpError(
-            f"remote read: missing sentinels in output:\n{out[:1000]}"
-        )
+        raise FileOpError(f"remote read: missing sentinels in output:\n{out[:1000]}")
     b64 = out[bi + len(_BIN_BEGIN) : ei].strip()
     # The b64 payload may contain extra whitespace from terminal wrapping; normalize.
     b64 = "".join(b64.split())
@@ -90,6 +94,35 @@ async def read_remote_file(
             pass
 
     return data, size
+
+
+async def read_entire_remote_file(pane_id: str, path: str) -> bytes:
+    """Read a complete remote file by chunking through read_remote_file."""
+    chunks: list[bytes] = []
+    offset = 0
+
+    while True:
+        data, total_size = await read_remote_file(
+            pane_id, path, offset=offset, limit=MAX_READ_BYTES
+        )
+        chunks.append(data)
+        offset += len(data)
+
+        if total_size >= 0:
+            if offset >= total_size:
+                break
+            if not data:
+                raise FileOpError(
+                    f"remote read made no progress at offset {offset} of {total_size}"
+                )
+            continue
+
+        if len(data) < MAX_READ_BYTES:
+            break
+        if not data:
+            raise FileOpError(f"remote read made no progress at offset {offset}")
+
+    return b"".join(chunks)
 
 
 async def write_remote_file(pane_id: str, path: str, content: bytes) -> int:
@@ -122,8 +155,10 @@ async def write_remote_file(pane_id: str, path: str, content: bytes) -> int:
         "f=open(src,'rb'); data=base64.b64decode(f.read()); f.close(); "
         "d=os.path.dirname(os.path.abspath(dst)) or '.'; "
         "os.makedirs(d,exist_ok=True); "
+        "mode=(os.stat(dst).st_mode&0o7777) if os.path.exists(dst) else None; "
         "fd,tmp=tempfile.mkstemp(dir=d,prefix='.rsm-tmp-'); "
-        "os.write(fd,data); os.close(fd); os.replace(tmp,dst); "
+        "mode is None or os.fchmod(fd,mode); "
+        "f=os.fdopen(fd,'wb'); f.write(data); f.close(); os.replace(tmp,dst); "
         "os.unlink(src); "
         "print('wrote',len(data),'bytes to',dst)"
     )
@@ -150,10 +185,12 @@ async def edit_remote_file(
     - If `old` appears more than once and `replace_all=False`, raise.
     - Otherwise replace and write back atomically.
     """
+    if old == "":
+        raise FileOpError("old must not be empty.")
     if old == new:
         raise FileOpError("old and new are identical — nothing to do.")
 
-    data, _ = await read_remote_file(pane_id, path)
+    data = await read_entire_remote_file(pane_id, path)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as e:
@@ -182,4 +219,6 @@ async def edit_remote_file(
 
     new_bytes = new_text.encode("utf-8")
     await write_remote_file(pane_id, path, new_bytes)
-    return EditResult(path=path, occurrences_replaced=replaced, bytes_after=len(new_bytes))
+    return EditResult(
+        path=path, occurrences_replaced=replaced, bytes_after=len(new_bytes)
+    )

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import re
 import secrets
+import shlex
 import subprocess
 import time
 from dataclasses import dataclass
@@ -98,16 +99,7 @@ async def run_in_pane(
     # random marker value.
     begin_re = re.compile(re.escape(begin_literal))
 
-    # Strict single-line wrapping. Newlines in user_cmd would cause the paste
-    # to be split into multiple shell lines, breaking sentinel ordering.
-    safe_user_cmd = user_cmd.replace("\n", "; ").replace("\r", "")
-    wrapped = (
-        f'RSM_M="{marker}"; '
-        f'echo "__RSM_BEGIN_${{RSM_M}}__"; '
-        f"{safe_user_cmd}; "
-        f"__rsm_rc=$?; "
-        f'echo "__RSM_END_${{RSM_M}}_${{__rsm_rc}}__"'
-    )
+    wrapped = _wrap_command(marker, user_cmd)
 
     start = time.monotonic()
     await paste_text(target, wrapped)
@@ -142,6 +134,25 @@ async def run_in_pane(
             )
 
         await asyncio.sleep(poll_interval)
+
+
+def _wrap_command(marker: str, user_cmd: str) -> str:
+    """Build the single shell line pasted into the pane for a user command."""
+    # Strict single-line wrapping. Newlines in user_cmd would cause the paste
+    # to be split into multiple shell lines, breaking sentinel ordering.
+    safe_user_cmd = user_cmd.replace("\n", "; ").replace("\r", "")
+    if not safe_user_cmd.strip():
+        raise ValueError("remote command must not be empty")
+
+    return (
+        f'RSM_M="{marker}"; '
+        f'echo "__RSM_BEGIN_${{RSM_M}}__"; '
+        f"__rsm_cmd={shlex.quote(safe_user_cmd)}; "
+        f'eval "$__rsm_cmd"; '
+        f"__rsm_rc=$?; "
+        f'RSM_M="{marker}"; '
+        f'echo "__RSM_END_${{RSM_M}}_${{__rsm_rc}}__"'
+    )
 
 
 def _extract_output(screen: str, begin_re: re.Pattern[str], end_pos: int) -> str:

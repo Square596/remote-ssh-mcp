@@ -1,0 +1,20 @@
+{
+  "name": "Square596",
+  "interface": {
+    "displayName": "Square596"
+  },
+  "plugins": [
+    {
+      "name": "remote-ssh-mcp",
+      "source": {
+        "source": "local",
+        "path": "./plugins/remote-ssh-mcp"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

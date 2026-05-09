@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import secrets
 import shlex
 import subprocess
 from dataclasses import dataclass, field
+from os.path import expanduser
 from typing import Optional
 
 from .runner import _tmux, capture_pane, run_in_pane
@@ -31,6 +31,23 @@ class SessionError(Exception):
 
 
 @dataclass
+class SshAddResult:
+    paths: list[str] = field(default_factory=list)
+    exit_code: Optional[int] = None
+    output: Optional[str] = None
+    warning: Optional[str] = None
+
+
+@dataclass
+class PreflightResult:
+    agent_warning: Optional[str] = None
+    ssh_add_paths: list[str] = field(default_factory=list)
+    ssh_add_exit_code: Optional[int] = None
+    ssh_add_output: Optional[str] = None
+    forwarded_agent_present: Optional[bool] = None
+
+
+@dataclass
 class Connection:
     connection_id: str
     host: str
@@ -42,6 +59,11 @@ class Connection:
     cwd: str = "?"
     cwd_warning: Optional[str] = None
     agent_warning: Optional[str] = None
+    agent_forwarding: bool = True
+    ssh_add_paths: list[str] = field(default_factory=list)
+    ssh_add_exit_code: Optional[int] = None
+    ssh_add_output: Optional[str] = None
+    forwarded_agent_present: Optional[bool] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -55,22 +77,26 @@ class SessionManager:
         host: str,
         project_path: Optional[str] = None,
         label: Optional[str] = None,
-        require_agent_forwarding: bool = False,
+        agent_forwarding: bool = True,
+        ssh_add_paths: Optional[list[str]] = None,
     ) -> Connection:
         async with self._connect_lock:
             session = _session_name(host)
             label = label or f"agent-{secrets.token_hex(3)}"
 
-            agent_warning = await self._preflight(
-                host, require_agent_forwarding=require_agent_forwarding
+            preflight = await self._preflight(
+                host,
+                agent_forwarding=agent_forwarding,
+                ssh_add_paths=ssh_add_paths,
             )
 
             # ServerAliveInterval keeps idle TCP connections from being torn
             # down by middleboxes or aggressive remote configs — relevant when
             # multiple subagents connect in parallel and one sits briefly idle
             # between connect-completion and its first command.
+            agent_flag = "-A " if agent_forwarding else ""
             ssh_cmd = (
-                f"ssh -A "
+                f"ssh {agent_flag}"
                 f"-o ServerAliveInterval=30 "
                 f"-o ServerAliveCountMax=3 "
                 f"{shlex.quote(host)}"
@@ -130,17 +156,37 @@ class SessionManager:
                 label=label,
                 cwd=cwd,
                 cwd_warning=cwd_warning,
-                agent_warning=agent_warning,
+                agent_warning=preflight.agent_warning,
+                agent_forwarding=agent_forwarding,
+                ssh_add_paths=preflight.ssh_add_paths,
+                ssh_add_exit_code=preflight.ssh_add_exit_code,
+                ssh_add_output=preflight.ssh_add_output,
+                forwarded_agent_present=preflight.forwarded_agent_present,
             )
             self._connections[conn_id] = conn
             return conn
 
     async def _preflight(
-        self, host: str, require_agent_forwarding: bool = False
-    ) -> Optional[str]:
+        self,
+        host: str,
+        agent_forwarding: bool = True,
+        ssh_add_paths: Optional[list[str]] = None,
+    ) -> PreflightResult:
+        warnings: list[str] = []
+        ssh_args = ["ssh"]
+        result = PreflightResult()
+
+        if agent_forwarding:
+            ssh_add = await self._ssh_add(ssh_add_paths)
+            result.ssh_add_paths = ssh_add.paths
+            result.ssh_add_exit_code = ssh_add.exit_code
+            result.ssh_add_output = ssh_add.output
+            if ssh_add.warning:
+                warnings.append(ssh_add.warning)
+            ssh_args.append("-A")
+
         proc = await asyncio.create_subprocess_exec(
-            "ssh",
-            "-A",
+            *ssh_args,
             "-o",
             "BatchMode=yes",
             "-o",
@@ -162,9 +208,9 @@ class SessionManager:
                 f"Try `ssh {host}` in a regular terminal first. ssh said:\n{stderr}"
             )
 
-        strict_agent = require_agent_forwarding or os.environ.get(
-            "REMOTE_SSH_MCP_REQUIRE_AGENT", ""
-        ).lower() in {"1", "true", "yes", "on"}
+        if not agent_forwarding:
+            result.agent_warning = "\n".join(warnings) if warnings else None
+            return result
 
         proc = await asyncio.create_subprocess_exec(
             "ssh",
@@ -181,8 +227,11 @@ class SessionManager:
         )
         _, err = await proc.communicate()
         if proc.returncode == 0:
-            return None
+            result.forwarded_agent_present = True
+            result.agent_warning = "\n".join(warnings) if warnings else None
+            return result
 
+        result.forwarded_agent_present = False
         if proc.returncode == 1:
             warning = (
                 "Connected to the host, but ssh-agent has no keys loaded. "
@@ -190,7 +239,7 @@ class SessionManager:
                 "but forwarded-agent operations from the remote host, such as "
                 "private git fetches through your local agent, may fail. Run "
                 "`ssh-add` or call remote_connect with "
-                "`require_agent_forwarding=false` if forwarding is not needed."
+                "`agent_forwarding=false` if forwarding is not needed."
             )
         else:
             stderr = err.decode("utf-8", errors="replace").strip()
@@ -202,20 +251,88 @@ class SessionManager:
                 f"remote host may fail.{detail}"
             )
 
-        if strict_agent:
-            raise SessionError(
-                f"SSH connection to {host!r} works, but agent forwarding was "
-                f"required and is not ready. {warning}"
+        warnings.append(warning)
+        result.agent_warning = "\n".join(warnings)
+        return result
+
+    async def _ssh_add(self, ssh_add_paths: Optional[list[str]]) -> SshAddResult:
+        paths = [expanduser(path) for path in ssh_add_paths or []]
+        explicit_paths = bool(paths)
+        args = ["ssh-add"]
+        args.extend(paths)
+
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            if paths:
+                warning = (
+                    "Timed out while running local `ssh-add` for the requested "
+                    "key path(s). Continuing with the current ssh-agent; some "
+                    "requested keys may not have been added. Check the paths "
+                    "and reconnect with corrected paths if those keys are "
+                    "needed."
+                )
+            else:
+                warning = (
+                    "Timed out while running local `ssh-add` before connecting. "
+                    "Continuing, but forwarded-agent operations from the remote "
+                    "host may fail."
+                )
+            return SshAddResult(paths=paths, output=warning, warning=warning)
+
+        output = self._process_output(out, err)
+
+        if proc.returncode == 0:
+            return SshAddResult(
+                paths=paths,
+                exit_code=proc.returncode,
+                output=output,
             )
-        return warning
+
+        if explicit_paths:
+            warning = (
+                "Local `ssh-add` returned a non-zero exit code while adding "
+                "the requested key path(s). Continuing with the current "
+                "ssh-agent; some requested keys may not have been added. "
+                "Check the paths and reconnect with corrected paths if those "
+                "keys are needed."
+            )
+        else:
+            warning = (
+                "Local `ssh-add` did not complete successfully before "
+                "connecting. Continuing, but forwarded-agent operations from "
+                "the remote host may fail."
+            )
+
+        return SshAddResult(
+            paths=paths,
+            exit_code=proc.returncode,
+            output=output,
+            warning=warning,
+        )
+
+    @staticmethod
+    def _process_output(stdout: bytes, stderr: bytes) -> Optional[str]:
+        parts = [
+            chunk.decode("utf-8", errors="replace").strip()
+            for chunk in (stdout, stderr)
+            if chunk.strip()
+        ]
+        return "\n".join(parts) if parts else None
 
     async def _session_exists(self, session: str) -> bool:
         rc, _, _ = await _tmux("has-session", "-t", f"={session}")
         return rc == 0
 
-    async def _new_session(
-        self, session: str, label: str, cmd: str
-    ) -> tuple[str, str]:
+    async def _new_session(self, session: str, label: str, cmd: str) -> tuple[str, str]:
         rc, out, err = await _tmux(
             "new-session",
             "-d",
@@ -239,9 +356,7 @@ class SessionManager:
         window_id, pane_id = out.decode().strip().split()
         return window_id, pane_id
 
-    async def _new_window(
-        self, session: str, label: str, cmd: str
-    ) -> tuple[str, str]:
+    async def _new_window(self, session: str, label: str, cmd: str) -> tuple[str, str]:
         rc, out, err = await _tmux(
             "new-window",
             "-t",
@@ -343,6 +458,11 @@ class SessionManager:
                 "session_name": c.session_name,
                 "window_id": c.window_id,
                 "agent_warning": c.agent_warning,
+                "agent_forwarding": c.agent_forwarding,
+                "ssh_add_paths": c.ssh_add_paths,
+                "ssh_add_exit_code": c.ssh_add_exit_code,
+                "ssh_add_output": c.ssh_add_output,
+                "forwarded_agent_present": c.forwarded_agent_present,
             }
             for c in self._connections.values()
         ]
