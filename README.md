@@ -15,8 +15,9 @@ no way to watch what's happening.
 
 `remote-ssh-mcp` fixes that by:
 
-- Opening one persistent tmux session per remote host with `ssh -A` (agent
-  forwarding) so the shell state sticks across calls.
+- Opening one persistent tmux session per remote host, using `ssh -A` by
+  default so forwarded-agent operations are available when your local agent is
+  usable, and keeping shell state across calls.
 - Giving each agent (parent + subagents) its own tmux **window**, so
   parallel work doesn't race on the same shell.
 - Exposing a full toolkit (`remote_run`, `remote_read`, `remote_write`,
@@ -36,9 +37,8 @@ on single-file reads. See [Limitations](#limitations).
 
 - `tmux` 3.0+ on your laptop.
 - An SSH config entry for the remote host (i.e. `ssh <host>` works in a normal
-  terminal). Agent forwarding is requested via `ssh -A`, but a reachable local
-  ssh-agent is only required when you need forwarded-agent operations from the
-  remote host.
+  terminal). Agent forwarding is requested by default via `ssh -A`; pass
+  `agent_forwarding=false` to `remote_connect` to disable it.
 - `python3` on the **remote** host (used for atomic file writes via base64).
 - `uv` or `pipx` on your laptop.
 
@@ -54,6 +54,11 @@ how to use it. In Claude Code, install it with:
 
 The MCP server is launched via `uvx`, which downloads and caches the
 Python entrypoint on first run — no separate `pip install` step needed.
+
+The same plugin directory includes Codex metadata
+(`plugins/remote-ssh-mcp/.codex-plugin/plugin.json`) and a repo-local Codex
+marketplace entry (`.agents/plugins/marketplace.json`). Both Claude Code and
+Codex use the bundled `.mcp.json` plus the `remote-ssh` skill.
 
 To upgrade later: `uvx --refresh --from git+https://github.com/Square596/remote-ssh-mcp remote-ssh-mcp --help` (any `uvx` invocation with `--refresh` re-pulls).
 
@@ -110,14 +115,11 @@ or call the tool directly:
 remote_connect(host="<host>", project_path="/home/me/myproject")
 ```
 
-Claude Code plugin users can also invoke `/remote-server <host>`; that skill
-name remains available for compatibility.
-
 `<host>` is whatever alias you use in `~/.ssh/config` — the same string
 that works for plain `ssh <host>`.
 
 The skill will:
-1. Connect via `ssh -A <host>`, opening a fresh tmux window in the
+1. Run local `ssh-add`, then connect via `ssh -A <host>`, opening a fresh tmux window in the
    `remote-ssh-mcp/<host>` session.
 2. `cd` into your project path.
 3. Tell the agent to use `remote_*` tools for **all** subsequent file/exec
@@ -137,7 +139,7 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 
 | Tool | Local equivalent | Notes |
 |---|---|---|
-| `remote_connect(host, project_path?, label?, require_agent_forwarding?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning}`. |
+| `remote_connect(host, project_path?, label?, agent_forwarding?, ssh_add_paths?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning, forwarded_agent_present, ssh_add_paths, ssh_add_exit_code, ssh_add_output}`. |
 | `remote_disconnect(connection_id)` | — | Closes window. Closes session if last window. |
 | `remote_status()` | — | Lists active connections. |
 | `remote_run(connection_id, cmd, timeout?)` | Bash | Persistent shell. Returns `{stdout, exit_code, duration_ms}`. |
@@ -152,15 +154,20 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 **`Couldn't connect to <host>`.** Check in this order:
 1. `ssh <host>` works in a regular terminal (host is in `~/.ssh/config`).
 2. The host supports non-interactive key-based auth (`BatchMode=yes`).
-3. If you need forwarded-agent operations from the remote host, `ssh-add -l`
-   lists at least one key and agent forwarding is allowed.
+3. If you need forwarded-agent operations from the remote host, local `ssh-add`
+   can load your keys and agent forwarding is allowed.
 
 **`agent_warning` is present.** The SSH connection worked, but the MCP server
-could not confirm a usable local ssh-agent. Normal remote commands can still
-work through `IdentityFile` or other OpenSSH config. Private git fetches from
-the remote that rely on forwarded agent keys may fail. Set
-`require_agent_forwarding=true` or `REMOTE_SSH_MCP_REQUIRE_AGENT=1` to make
-that condition fatal.
+could not confirm a usable forwarded ssh-agent. Normal remote commands can
+still work through `IdentityFile` or other OpenSSH config. Private git fetches
+from the remote that rely on forwarded agent keys may fail. Pass
+`agent_forwarding=false` if you do not want the MCP server to run local
+`ssh-add`, connect with `ssh -A`, or check forwarded-agent readiness.
+
+**Explicit `ssh_add_paths` partially fail.** `remote_connect` still proceeds if
+bulk `ssh-add <paths...>` returns non-zero. The response includes the expanded
+`ssh_add_paths`, `ssh_add_exit_code`, and `ssh_add_output` so the agent can tell
+you which requested paths may need checking before reconnecting.
 
 **The pane gets noisy with base64 blobs.** Yes — that's the cost of routing
 file writes through the visible terminal. The skill prefixes blobs with a
@@ -176,8 +183,9 @@ to your window. Check the parent's prompt to subagents.
 - **One pane per connection, serialized calls.** Parallel calls on the same
   `connection_id` queue. Use separate connections (subagents) for parallelism,
   or `nohup … &` for true background work.
-- **Single-file reads capped at ~1 MB.** Larger files require chunked reads
-  (deferred to v2).
+- **Single `remote_read` calls are capped at ~1 MB.** Read larger files in
+  chunks with `offset` and `limit`; `remote_edit` chunks internally for UTF-8
+  text files.
 - **No interactive TUI driving.** Things that need a TTY (vim, less in
   interactive mode, sudo password prompts) won't work cleanly. Use
   non-interactive equivalents.

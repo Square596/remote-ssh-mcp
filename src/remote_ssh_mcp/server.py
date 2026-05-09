@@ -35,12 +35,17 @@ async def remote_connect(
     host: str,
     project_path: Optional[str] = None,
     label: Optional[str] = None,
-    require_agent_forwarding: bool = False,
+    agent_forwarding: bool = True,
+    ssh_add_paths: Optional[list[str]] = None,
 ) -> dict:
-    """Open a new tmux window on the per-host session, ssh -A into `host`, and
-    optionally `cd` into `project_path`. Returns a `connection_id` to pass to all
-    subsequent remote_* calls. Each call to remote_connect creates a fresh
-    window — parent and subagents should each call remote_connect for isolation.
+    """Open a new tmux window on the per-host session, ssh into `host`, and
+    optionally `cd` into `project_path`. By default, the connection uses
+    `ssh -A` and first runs local `ssh-add`; pass `agent_forwarding=false` to
+    skip agent forwarding and all ssh-agent checks. If `ssh_add_paths` is set,
+    those local key paths are passed to `ssh-add` instead of running bare
+    `ssh-add`. Returns a `connection_id` to pass to all subsequent remote_*
+    calls. Each call to remote_connect creates a fresh window — parent and
+    subagents should each call remote_connect for isolation.
 
     The response includes `cwd` (the actual current directory after the cd
     attempt) and `cwd_warning` (non-null if `project_path` was provided but the
@@ -48,17 +53,19 @@ async def remote_connect(
     sets). When cwd_warning is set, surface it to the user verbatim and stop —
     don't proceed silently from $HOME.
 
-    By default, SSH config authentication is enough to connect. If
-    `require_agent_forwarding` is true, the connection also requires a reachable
-    ssh-agent with loaded keys. The response includes `agent_warning` when the
-    host is reachable but forwarded-agent operations may fail.
+    SSH connectivity failures are fatal. The response includes structured
+    ssh-agent details: `forwarded_agent_present`, `ssh_add_paths`,
+    `ssh_add_exit_code`, and `ssh_add_output`. Forwarded-agent readiness and
+    ssh-add failures are reported as `agent_warning` when remote operations
+    such as private git fetches may fail.
     """
     try:
         conn = await sessions.connect(
             host=host,
             project_path=project_path,
             label=label,
-            require_agent_forwarding=require_agent_forwarding,
+            agent_forwarding=agent_forwarding,
+            ssh_add_paths=ssh_add_paths,
         )
     except SessionError as e:
         return _err(str(e))
@@ -69,6 +76,11 @@ async def remote_connect(
         cwd=conn.cwd,
         cwd_warning=conn.cwd_warning,
         agent_warning=conn.agent_warning,
+        agent_forwarding=conn.agent_forwarding,
+        ssh_add_paths=conn.ssh_add_paths,
+        ssh_add_exit_code=conn.ssh_add_exit_code,
+        ssh_add_output=conn.ssh_add_output,
+        forwarded_agent_present=conn.forwarded_agent_present,
         session_name=conn.session_name,
         label=conn.label,
         attach_hint=f"tmux attach -t {conn.session_name}",
@@ -113,6 +125,8 @@ async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
             "then remote_run to execute it.\n"
             "  - For heredocs: same — write the document body via remote_write."
         )
+    if not cmd.strip():
+        return _err("remote_run rejects empty commands.")
 
     try:
         conn = sessions.get(connection_id)
@@ -120,7 +134,10 @@ async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
         return _err(str(e))
 
     async with conn.lock:
-        result = await run_in_pane(conn.pane_id, cmd, timeout=float(timeout))
+        try:
+            result = await run_in_pane(conn.pane_id, cmd, timeout=float(timeout))
+        except ValueError as e:
+            return _err(str(e))
 
     return _ok(
         stdout=result.stdout,
@@ -224,6 +241,8 @@ async def remote_grep(
         conn = sessions.get(connection_id)
     except SessionError as e:
         return _err(str(e))
+    if max_results <= 0:
+        return _err("max_results must be > 0")
 
     flags = ["-n", "--color=never"]
     if case_insensitive:
@@ -237,8 +256,8 @@ async def remote_grep(
 
     cmd = (
         f"if command -v rg >/dev/null 2>&1; then "
-        f"rg {rg_args} -m {max_results} {shlex.quote(pattern)} {shlex.quote(path)} "
-        f"|| true; "
+        f"rg {rg_args} {shlex.quote(pattern)} {shlex.quote(path)} "
+        f"| head -n {max_results} || true; "
         f"else "
         f"grep -rnE{grep_case} {grep_glob} {shlex.quote(pattern)} {shlex.quote(path)} "
         f"| head -n {max_results} || true; "
@@ -252,7 +271,9 @@ async def remote_grep(
         return _err("grep timed out", partial_stdout=result.stdout)
 
     matches = [line for line in result.stdout.splitlines() if line.strip()]
-    return _ok(matches=matches, count=len(matches), truncated=len(matches) >= max_results)
+    return _ok(
+        matches=matches, count=len(matches), truncated=len(matches) >= max_results
+    )
 
 
 @mcp.tool()
