@@ -40,8 +40,11 @@ async def remote_connect(
 ) -> dict:
     """Open a new tmux window on the per-host session, ssh into `host`, and
     optionally `cd` into `project_path`. By default, the connection uses
-    `ssh -A` and first runs local `ssh-add`; pass `agent_forwarding=false` to
-    skip agent forwarding and all ssh-agent checks. If `ssh_add_paths` is set,
+    `ssh -A` and first runs local `ssh-add` when the MCP server was launched
+    with `SSH_AUTH_SOCK`; pass `agent_forwarding=false` to skip agent
+    forwarding and all ssh-agent checks. If `SSH_AUTH_SOCK` is missing,
+    forwarding is skipped automatically and the response includes an
+    `agent_warning`. If `ssh_add_paths` is set and forwarding is available,
     those local key paths are passed to `ssh-add` instead of running bare
     `ssh-add`. Returns a `connection_id` to pass to all subsequent remote_*
     calls. Each call to remote_connect creates a fresh window — parent and

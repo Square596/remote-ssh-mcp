@@ -15,9 +15,10 @@ no way to watch what's happening.
 
 `remote-ssh-mcp` fixes that by:
 
-- Opening one persistent tmux session per remote host, using `ssh -A` by
-  default so forwarded-agent operations are available when your local agent is
-  usable, and keeping shell state across calls.
+- Opening one persistent tmux session per remote host, using `ssh -A` when
+  the MCP server was launched with `SSH_AUTH_SOCK` so forwarded-agent
+  operations are available when your local agent is usable, and keeping shell
+  state across calls.
 - Giving each agent (parent + subagents) its own tmux **window**, so
   parallel work doesn't race on the same shell.
 - Exposing a full toolkit (`remote_run`, `remote_read`, `remote_write`,
@@ -37,8 +38,11 @@ on single-file reads. See [Limitations](#limitations).
 
 - `tmux` 3.0+ on your laptop.
 - An SSH config entry for the remote host (i.e. `ssh <host>` works in a normal
-  terminal). Agent forwarding is requested by default via `ssh -A`; pass
-  `agent_forwarding=false` to `remote_connect` to disable it.
+  terminal). Agent forwarding is requested by default via `ssh -A` when
+  `SSH_AUTH_SOCK` is present in the MCP server environment. If it is missing,
+  `remote_connect` skips forwarding automatically and returns an
+  `agent_warning`; pass `agent_forwarding=false` to disable forwarding
+  explicitly.
 - `python3` on the **remote** host (used for atomic file writes via base64).
 - `uv` or `pipx` on your laptop.
 
@@ -88,6 +92,12 @@ You can also install the Python package directly:
 uv tool install git+https://github.com/Square596/remote-ssh-mcp
 ```
 
+To update a manual `uv tool` install later:
+
+```bash
+uv tool upgrade remote-ssh-mcp
+```
+
 Then add the installed command to your MCP client config:
 
 ```json
@@ -119,8 +129,10 @@ remote_connect(host="<host>", project_path="/home/me/myproject")
 that works for plain `ssh <host>`.
 
 The skill will:
-1. Run local `ssh-add`, then connect via `ssh -A <host>`, opening a fresh tmux window in the
-   `remote-ssh-mcp/<host>` session.
+1. If `SSH_AUTH_SOCK` is present, run local `ssh-add`, then connect via
+   `ssh -A <host>`, opening a fresh tmux window in the
+   `remote-ssh-mcp/<host>` session. If `SSH_AUTH_SOCK` is missing, it connects
+   without `ssh -A` and reports the returned `agent_warning`.
 2. `cd` into your project path.
 3. Tell the agent to use `remote_*` tools for **all** subsequent file/exec
    work, and to brief subagents to do the same.
@@ -139,7 +151,7 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 
 | Tool | Local equivalent | Notes |
 |---|---|---|
-| `remote_connect(host, project_path?, label?, agent_forwarding?, ssh_add_paths?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning, forwarded_agent_present, ssh_add_paths, ssh_add_exit_code, ssh_add_output}`. |
+| `remote_connect(host, project_path?, label?, agent_forwarding?, ssh_add_paths?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning, agent_forwarding, forwarded_agent_present, ssh_add_paths, ssh_add_exit_code, ssh_add_output}`. |
 | `remote_disconnect(connection_id)` | — | Closes window. Closes session if last window. |
 | `remote_status()` | — | Lists active connections. |
 | `remote_run(connection_id, cmd, timeout?)` | Bash | Persistent shell. Returns `{stdout, exit_code, duration_ms}`. |
@@ -157,12 +169,15 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 3. If you need forwarded-agent operations from the remote host, local `ssh-add`
    can load your keys and agent forwarding is allowed.
 
-**`agent_warning` is present.** The SSH connection worked, but the MCP server
-could not confirm a usable forwarded ssh-agent. Normal remote commands can
-still work through `IdentityFile` or other OpenSSH config. Private git fetches
-from the remote that rely on forwarded agent keys may fail. Pass
-`agent_forwarding=false` if you do not want the MCP server to run local
-`ssh-add`, connect with `ssh -A`, or check forwarded-agent readiness.
+**`agent_warning` is present.** The SSH connection worked, but forwarded-agent
+access is not ready. If the MCP server was launched without `SSH_AUTH_SOCK`,
+`remote_connect` skips local `ssh-add`, skips `ssh -A`, returns
+`agent_forwarding=false`, and tells the agent to report that forwarding is not
+working. Normal remote commands can still work through `IdentityFile` or other
+OpenSSH config. Private git fetches from the remote that rely on forwarded
+agent keys may fail. If forwarding is needed, start the MCP client from an
+environment that exports `SSH_AUTH_SOCK` or configure the client to pass it
+through.
 
 **Explicit `ssh_add_paths` partially fail.** `remote_connect` still proceeds if
 bulk `ssh-add <paths...>` returns non-zero. The response includes the expanded

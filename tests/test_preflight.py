@@ -44,6 +44,40 @@ def ssh_host() -> str:
     return f"host-{uuid.uuid4().hex}"
 
 
+@pytest.fixture(autouse=True)
+def ssh_auth_sock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/remote-ssh-mcp-test-agent.sock")
+
+
+@pytest.mark.asyncio
+async def test_preflight_missing_ssh_auth_sock_skips_agent_forwarding(
+    monkeypatch, ssh_host
+):
+    monkeypatch.delenv("SSH_AUTH_SOCK", raising=False)
+    calls = install_process_mock(monkeypatch, [FakeProc(0)])
+
+    result = await SessionManager()._preflight(ssh_host)
+
+    assert result.agent_warning is not None
+    assert "SSH_AUTH_SOCK" in result.agent_warning
+    assert "ssh-agent forwarding is disabled" in result.agent_warning
+    assert result.agent_forwarding is False
+    assert result.forwarded_agent_present is None
+    assert result.ssh_add_exit_code is None
+    assert result.ssh_add_output is None
+    assert calls == [
+        (
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            ssh_host,
+            "true",
+        )
+    ]
+
+
 @pytest.mark.asyncio
 async def test_preflight_allows_identityfile_auth_without_agent(monkeypatch, ssh_host):
     calls = install_process_mock(
@@ -59,6 +93,7 @@ async def test_preflight_allows_identityfile_auth_without_agent(monkeypatch, ssh
 
     assert result.agent_warning is not None
     assert "ssh-agent is not reachable from the remote shell" in result.agent_warning
+    assert result.agent_forwarding is True
     assert result.forwarded_agent_present is False
     assert result.ssh_add_exit_code == 0
     assert result.ssh_add_paths == []
@@ -84,6 +119,7 @@ async def test_preflight_allows_empty_agent_by_default(monkeypatch, ssh_host):
 
     assert result.agent_warning is not None
     assert "no keys loaded" in result.agent_warning
+    assert result.agent_forwarding is True
     assert result.forwarded_agent_present is False
 
 
@@ -104,6 +140,7 @@ async def test_preflight_local_bare_ssh_add_failure_warns(monkeypatch, ssh_host)
     assert "Local `ssh-add` did not complete successfully" in result.agent_warning
     assert result.ssh_add_exit_code == 2
     assert result.ssh_add_output == "Error connecting to agent"
+    assert result.agent_forwarding is True
     assert result.forwarded_agent_present is True
 
 
@@ -142,6 +179,7 @@ async def test_preflight_explicit_ssh_add_paths_bulk_failure_warns(
     assert result.ssh_add_paths == key_paths
     assert result.ssh_add_exit_code == 1
     assert result.ssh_add_output == ssh_add_output.decode()
+    assert result.agent_forwarding is True
     assert result.forwarded_agent_present is True
 
 
@@ -160,6 +198,7 @@ async def test_preflight_loaded_agent_has_no_warning(monkeypatch, ssh_host):
     result = await SessionManager()._preflight(ssh_host)
 
     assert result.agent_warning is None
+    assert result.agent_forwarding is True
     assert result.forwarded_agent_present is True
     assert result.ssh_add_exit_code == 0
 
@@ -171,6 +210,7 @@ async def test_preflight_can_disable_agent_forwarding(monkeypatch, ssh_host):
     result = await SessionManager()._preflight(ssh_host, agent_forwarding=False)
 
     assert result.agent_warning is None
+    assert result.agent_forwarding is False
     assert result.forwarded_agent_present is None
     assert result.ssh_add_exit_code is None
     assert result.ssh_add_output is None
@@ -238,6 +278,53 @@ async def test_connect_omits_agent_forwarding_from_session_command(
     assert conn.ssh_add_exit_code == 1
     assert conn.ssh_add_output == "ssh-add output"
     assert conn.forwarded_agent_present is False
+
+
+@pytest.mark.asyncio
+async def test_connect_omits_agent_forwarding_when_preflight_skips_it(
+    monkeypatch, ssh_host, tmp_path
+):
+    sm = SessionManager()
+    session_cmds: list[str] = []
+
+    async def fake_preflight(*args, **kwargs):
+        return PreflightResult(
+            agent_warning="MCP server was launched without `SSH_AUTH_SOCK`",
+            agent_forwarding=False,
+            forwarded_agent_present=None,
+        )
+
+    async def fake_session_exists(*args, **kwargs):
+        return False
+
+    async def fake_new_session(session, label, cmd):
+        session_cmds.append(cmd)
+        return "%1", "%1.0"
+
+    async def fake_configure_history(*args, **kwargs):
+        return None
+
+    async def fake_wait_for_shell(*args, **kwargs):
+        return None
+
+    async def fake_run_in_pane(*args, **kwargs):
+        return SimpleNamespace(stdout=f"{tmp_path / 'cwd'}\n", exit_code=0)
+
+    monkeypatch.setattr(sm, "_preflight", fake_preflight)
+    monkeypatch.setattr(sm, "_session_exists", fake_session_exists)
+    monkeypatch.setattr(sm, "_new_session", fake_new_session)
+    monkeypatch.setattr(sm, "_configure_history", fake_configure_history)
+    monkeypatch.setattr(sm, "_wait_for_shell", fake_wait_for_shell)
+    monkeypatch.setattr("remote_ssh_mcp.session.run_in_pane", fake_run_in_pane)
+
+    conn = await sm.connect(ssh_host)
+
+    assert session_cmds == [
+        f"ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 {ssh_host}"
+    ]
+    assert conn.agent_warning == "MCP server was launched without `SSH_AUTH_SOCK`"
+    assert conn.agent_forwarding is False
+    assert conn.forwarded_agent_present is None
 
 
 @pytest.mark.asyncio

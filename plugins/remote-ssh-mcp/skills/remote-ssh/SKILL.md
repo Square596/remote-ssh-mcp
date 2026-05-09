@@ -31,10 +31,13 @@ Then call `remote_connect(host=<host>, project_path=<path>)`.
   - `forwarded_agent_present=false`: "SSH agent: not present or not accessible
     from the remote."
   - `forwarded_agent_present=null`: "SSH agent: forwarding disabled; not
-    checked."
+    checked." This can mean the caller requested `agent_forwarding=false`, or
+    the MCP server automatically skipped forwarding because it was launched
+    without `SSH_AUTH_SOCK`.
 - Also report the key-path arguments passed to local `ssh-add`:
   - If `agent_forwarding=false`: "SSH key paths added: none; ssh-add was not
-    run."
+    run." If `agent_warning` mentions missing `SSH_AUTH_SOCK`, add that
+    ssh-agent forwarding is not working for this connection and was skipped.
   - If `ssh_add_paths=[]`: "SSH key paths added: none; used bare ssh-add."
   - Otherwise list only the path strings from `ssh_add_paths`. Do not list
     fingerprints, key comments, or raw `ssh-add -l` output.
@@ -43,9 +46,11 @@ Then call `remote_connect(host=<host>, project_path=<path>)`.
   check those paths and reconnect with corrected paths if those keys are
   needed. Do not paste raw `ssh_add_output` unless it contains only path-based
   errors.
-- If `agent_warning` is non-null, include it as the warning detail. Continue
-  unless the user specifically needs remote commands to use their forwarded
-  local SSH agent.
+- If `agent_warning` is non-null, include it as the warning detail. If it says
+  `SSH_AUTH_SOCK` is missing, explicitly tell the user that ssh-agent
+  forwarding is not working for this connection and the MCP server connected
+  without it. Continue unless the user specifically needs remote commands to
+  use their forwarded local SSH agent.
 - If `cwd_warning` is non-null, the `cd` into `project_path` failed and the
   shell is in `$HOME`, not where the user asked. Stop after the connection and
   agent-status message, paste the warning verbatim, and ask the user for the

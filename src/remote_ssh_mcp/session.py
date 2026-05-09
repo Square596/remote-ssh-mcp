@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import secrets
 import shlex
@@ -41,6 +42,7 @@ class SshAddResult:
 @dataclass
 class PreflightResult:
     agent_warning: Optional[str] = None
+    agent_forwarding: bool = True
     ssh_add_paths: list[str] = field(default_factory=list)
     ssh_add_exit_code: Optional[int] = None
     ssh_add_output: Optional[str] = None
@@ -94,7 +96,8 @@ class SessionManager:
             # down by middleboxes or aggressive remote configs — relevant when
             # multiple subagents connect in parallel and one sits briefly idle
             # between connect-completion and its first command.
-            agent_flag = "-A " if agent_forwarding else ""
+            effective_agent_forwarding = agent_forwarding and preflight.agent_forwarding
+            agent_flag = "-A " if effective_agent_forwarding else ""
             ssh_cmd = (
                 f"ssh {agent_flag}"
                 f"-o ServerAliveInterval=30 "
@@ -157,7 +160,7 @@ class SessionManager:
                 cwd=cwd,
                 cwd_warning=cwd_warning,
                 agent_warning=preflight.agent_warning,
-                agent_forwarding=agent_forwarding,
+                agent_forwarding=effective_agent_forwarding,
                 ssh_add_paths=preflight.ssh_add_paths,
                 ssh_add_exit_code=preflight.ssh_add_exit_code,
                 ssh_add_output=preflight.ssh_add_output,
@@ -174,7 +177,22 @@ class SessionManager:
     ) -> PreflightResult:
         warnings: list[str] = []
         ssh_args = ["ssh"]
-        result = PreflightResult()
+        result = PreflightResult(agent_forwarding=agent_forwarding)
+
+        if agent_forwarding and not os.environ.get("SSH_AUTH_SOCK"):
+            agent_forwarding = False
+            result.agent_forwarding = False
+            warnings.append(
+                "MCP server was launched without `SSH_AUTH_SOCK`, so "
+                "ssh-agent forwarding is disabled for this connection. "
+                "Local `ssh-add` was not run and `ssh -A` was not used. "
+                "Remote commands can still work through `IdentityFile` or "
+                "other SSH config, but remote operations that rely on your "
+                "local agent, such as private git fetches, may fail. Restart "
+                "the MCP client from an environment that exports "
+                "`SSH_AUTH_SOCK`, or configure the MCP client to pass it "
+                "through, if forwarded-agent access is needed."
+            )
 
         if agent_forwarding:
             ssh_add = await self._ssh_add(ssh_add_paths)
