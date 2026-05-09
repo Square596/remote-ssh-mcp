@@ -163,7 +163,8 @@ The skill will:
    `remote-ssh-mcp/<host>` session.
 2. `cd` into your project path.
 3. Tell the agent to use `remote_*` tools for **all** subsequent file/exec
-   work, and to brief subagents to do the same.
+   work, track host/project/connection state, and brief subagents to create
+   their own connection.
 
 To watch:
 
@@ -172,6 +173,24 @@ tmux attach -t remote-ssh-mcp/<host>
 ```
 
 `Ctrl-b w` lists windows (one per active connection — parent + each subagent).
+
+## Agent config sync
+
+The plugin also ships a `remote-agent-config-sync` skill for importing remote
+agent instructions into a local directory. It is meant for files such as
+`AGENTS.md`, `CLAUDE.md`, `.agents/`, `.codex/`, `.claude/`, `.cursor/rules/`,
+hooks, rules, and skills.
+
+That workflow deliberately uses local `rsync` or `scp -rp` instead of adding
+generic transfer tools to the MCP API:
+
+- `remote_*` tools stay focused on watchable remote coding work through tmux.
+- `rsync`/`scp` handle bulk local/remote file movement better than base64
+  round-trips through a terminal pane.
+- Adaptation happens only after files are copied locally. The remote config
+  files are not modified by the sync workflow.
+- Ambiguous hooks, install scripts, absolute paths, secrets, credentials, and
+  destructive commands should be reviewed with the user before local adaptation.
 
 ## Tools
 
@@ -226,6 +245,9 @@ to your window. Check the parent's prompt to subagents.
 - **Single `remote_read` calls are capped at ~1 MB.** Read larger files in
   chunks with `offset` and `limit`; `remote_edit` chunks internally for UTF-8
   text files.
+- **No built-in scp/rsync tools.** Use the `remote-agent-config-sync` skill or
+  local shell commands for bulk transfer; keep `remote_*` for remote project
+  work.
 - **No interactive TUI driving.** Things that need a TTY (vim, less in
   interactive mode, sudo password prompts) won't work cleanly. Use
   non-interactive equivalents.
