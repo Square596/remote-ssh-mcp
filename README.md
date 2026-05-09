@@ -28,8 +28,9 @@ You can `tmux attach -t remote-ssh-mcp/<host>` at any time to watch.
 
 ## Status
 
-Alpha. v1 ships with single-window-per-connection serialization and a 1MB cap
-on single-file reads. See [Limitations](#limitations).
+Alpha. The current release ships with single-window-per-connection
+serialization and a 1MB cap on single-file reads. See
+[Limitations](#limitations).
 
 ## Install
 
@@ -40,7 +41,8 @@ on single-file reads. See [Limitations](#limitations).
   terminal). Agent forwarding is requested by default via `ssh -A`; pass
   `agent_forwarding=false` to `remote_connect` to disable it.
 - `python3` on the **remote** host (used for atomic file writes via base64).
-- `uv` or `pipx` on your laptop.
+- `uv` on your laptop for the bundled auto-updating plugin config. If you
+  install the MCP server manually, `uv` or `pipx` is fine.
 
 ### As a plugin with bundled skills
 
@@ -57,15 +59,43 @@ The same plugin directory includes Codex metadata
 marketplace entry (`.agents/plugins/marketplace.json`). Both Claude Code and
 Codex use the bundled `.mcp.json` plus the `remote-ssh` skill.
 
-The bundled MCP config installs or upgrades the uv-managed tool from GitHub
-on client startup, then launches `remote-ssh-mcp`. That keeps Codex, Claude,
-Cursor, and other MCP clients on the latest GitHub version when they start a
-new session. Startup depends on GitHub/network availability.
+The bundled MCP config requires `uv` in `PATH`. On client startup it installs
+or upgrades the uv-managed tool from GitHub, then launches `remote-ssh-mcp`.
+That keeps Codex, Claude, Cursor, and other MCP clients on the latest GitHub
+version when they start a new session. Startup depends on GitHub/network
+availability.
+
+### Repository plugin layout
+
+This repository carries both Claude Code and Codex plugin metadata:
+
+- `.claude-plugin/marketplace.json` is the Claude Code marketplace catalog.
+  Claude users add this repository as a marketplace and install
+  `remote-ssh-mcp` from it.
+- `.agents/plugins/marketplace.json` is the Codex marketplace catalog for the
+  same plugin.
+- `plugins/remote-ssh-mcp/.claude-plugin/plugin.json` is the Claude Code
+  manifest for the plugin itself.
+- `plugins/remote-ssh-mcp/.codex-plugin/plugin.json` is the Codex manifest for
+  the plugin itself, including Codex UI metadata.
+- `plugins/remote-ssh-mcp/.mcp.json` and
+  `plugins/remote-ssh-mcp/skills/remote-ssh/SKILL.md` are shared by both plugin
+  loaders.
+
+For Claude Code, keep only `plugin.json` inside `.claude-plugin/`; component
+directories such as `skills/` and config files such as `.mcp.json` live at the
+plugin root.
 
 ### As an MCP server (any MCP client)
 
-If you don't want the skill or you're on Codex, Cursor, or another MCP client,
-use the auto-updating stdio server directly:
+This section is for manual MCP setup when you are not installing the plugin
+package from a marketplace. The first JSON block intentionally mirrors
+`plugins/remote-ssh-mcp/.mcp.json`: plugin loaders read that file automatically,
+while plain MCP clients need an equivalent server definition in their own MCP
+config.
+
+If you want auto-updates on each client startup and have `uv` in `PATH`, use
+the auto-updating stdio server directly:
 
 ```json
 {
@@ -74,7 +104,7 @@ use the auto-updating stdio server directly:
       "command": "sh",
       "args": [
         "-lc",
-        "uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
       ],
       "env_vars": ["SSH_AUTH_SOCK"]
     }

@@ -4,7 +4,7 @@
       "command": "sh",
       "args": [
         "-lc",
-        "uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
       ],
       "env_vars": ["SSH_AUTH_SOCK"]
     }
