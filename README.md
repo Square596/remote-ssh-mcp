@@ -52,37 +52,41 @@ how to use it. In Claude Code, install it with:
 /plugin install remote-ssh-mcp@Square596
 ```
 
-The MCP server is launched via `uvx`, which downloads and caches the
-Python entrypoint on first run — no separate `pip install` step needed.
-
 The same plugin directory includes Codex metadata
 (`plugins/remote-ssh-mcp/.codex-plugin/plugin.json`) and a repo-local Codex
 marketplace entry (`.agents/plugins/marketplace.json`). Both Claude Code and
 Codex use the bundled `.mcp.json` plus the `remote-ssh` skill.
 
-To upgrade later: `uvx --refresh --from git+https://github.com/Square596/remote-ssh-mcp remote-ssh-mcp --help` (any `uvx` invocation with `--refresh` re-pulls).
+The bundled MCP config installs or upgrades the uv-managed tool from GitHub
+on client startup, then launches `remote-ssh-mcp`. That keeps Codex, Claude,
+Cursor, and other MCP clients on the latest GitHub version when they start a
+new session. Startup depends on GitHub/network availability.
 
 ### As an MCP server (any MCP client)
 
 If you don't want the skill or you're on Codex, Cursor, or another MCP client,
-use the stdio server directly:
+use the auto-updating stdio server directly:
 
 ```json
 {
   "mcpServers": {
     "remote-ssh": {
-      "command": "uvx",
+      "command": "sh",
       "args": [
-        "--from",
-        "git+https://github.com/Square596/remote-ssh-mcp",
-        "remote-ssh-mcp"
-      ]
+        "-lc",
+        "uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+      ],
+      "env_vars": ["SSH_AUTH_SOCK"]
     }
   }
 }
 ```
 
-You can also install the Python package directly:
+For Codex, `env_vars` forwards the local `SSH_AUTH_SOCK` value into the MCP
+server process so `ssh -A` can use your local ssh-agent. This requires Codex
+itself to be launched from an environment where `SSH_AUTH_SOCK` is set.
+
+You can also install the Python package directly as a stable uv-managed tool:
 
 ```bash
 uv tool install git+https://github.com/Square596/remote-ssh-mcp
@@ -104,6 +108,12 @@ For Claude Code CLI:
 
 ```bash
 claude mcp add remote-ssh remote-ssh-mcp
+```
+
+Installed tools are stable until upgraded. To update the installed command:
+
+```bash
+uv tool upgrade remote-ssh-mcp
 ```
 
 ## Usage
