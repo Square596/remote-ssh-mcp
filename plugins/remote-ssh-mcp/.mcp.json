@@ -1,12 +1,12 @@
 {
   "mcpServers": {
     "remote-ssh": {
-      "command": "uvx",
+      "command": "sh",
       "args": [
-        "--from",
-        "git+https://github.com/Square596/remote-ssh-mcp",
-        "remote-ssh-mcp"
-      ]
+        "-lc",
+        "uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+      ],
+      "env_vars": ["SSH_AUTH_SOCK"]
     }
   }
 }
