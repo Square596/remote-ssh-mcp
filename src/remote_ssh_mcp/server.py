@@ -38,26 +38,9 @@ async def remote_connect(
     agent_forwarding: bool = True,
     ssh_add_paths: Optional[list[str]] = None,
 ) -> dict:
-    """Open a new tmux window on the per-host session, ssh into `host`, and
-    optionally `cd` into `project_path`. By default, the connection uses
-    `ssh -A` and first runs local `ssh-add`; pass `agent_forwarding=false` to
-    skip agent forwarding and all ssh-agent checks. If `ssh_add_paths` is set,
-    those local key paths are passed to `ssh-add` instead of running bare
-    `ssh-add`. Returns a `connection_id` to pass to all subsequent remote_*
-    calls. Each call to remote_connect creates a fresh window — parent and
-    subagents should each call remote_connect for isolation.
-
-    The response includes `cwd` (the actual current directory after the cd
-    attempt) and `cwd_warning` (non-null if `project_path` was provided but the
-    cd failed — the shell will be in $HOME or whatever default the login shell
-    sets). When cwd_warning is set, surface it to the user verbatim and stop —
-    don't proceed silently from $HOME.
-
-    SSH connectivity failures are fatal. The response includes structured
-    ssh-agent details: `forwarded_agent_present`, `ssh_add_paths`,
-    `ssh_add_exit_code`, and `ssh_add_output`. Forwarded-agent readiness and
-    ssh-add failures are reported as `agent_warning` when remote operations
-    such as private git fetches may fail.
+    """Open a fresh tmux+SSH window for a host and optional project path.
+    Returns a `connection_id`, cwd, attach hint, and SSH agent status. If
+    `cwd_warning` is set, stop and ask for the correct path before working.
     """
     try:
         conn = await sessions.connect(
@@ -89,29 +72,21 @@ async def remote_connect(
 
 @mcp.tool()
 async def remote_disconnect(connection_id: str) -> dict:
-    """Close the tmux window for this connection. If it was the last window in
-    the per-host session, the session itself is torn down."""
+    """Close this connection's tmux window."""
     info = await sessions.disconnect(connection_id)
     return _ok(**info)
 
 
 @mcp.tool()
 async def remote_status() -> dict:
-    """List all active connections (across all hosts)."""
+    """List active remote connections."""
     return _ok(connections=sessions.list_connections())
 
 
 @mcp.tool()
 async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
-    """Run a SINGLE-LINE shell command in the persistent SSH session. Shell
-    state (cwd, env, activated venvs) is preserved across calls on the same
-    connection_id. Returns {ok, stdout, exit_code, duration_ms, timed_out}.
-
-    Multi-line scripts and heredocs are rejected — the runner sends commands
-    through the tmux paste-buffer which converts \\n to CR mid-paste, breaking
-    line continuation. For multi-line content, write a script with remote_write
-    then execute it with remote_run. For compound statements use ';' or '&&'
-    on a single line.
+    """Run one shell line in the persistent remote session. Cwd/env state is
+    preserved. For scripts or heredocs, write a file first with `remote_write`.
     """
     if "\n" in cmd or "\r" in cmd:
         return _err(
@@ -154,10 +129,7 @@ async def remote_read(
     offset: int = 0,
     limit: int = MAX_READ_BYTES,
 ) -> dict:
-    """Read a file from the remote host (≤1 MB per call). The read flows through
-    the visible tmux pane as a base64 round-trip. Returns the decoded text
-    (with replacement chars for invalid UTF-8) plus byte_size and total_size.
-    For binary content, use offset/limit to chunk."""
+    """Read up to 1 MB from a remote file. Use `offset`/`limit` for chunks."""
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
@@ -177,9 +149,7 @@ async def remote_read(
 
 @mcp.tool()
 async def remote_write(connection_id: str, path: str, content: str) -> dict:
-    """Write `content` (UTF-8) to `path` atomically. Creates parent dirs if
-    missing. Replaces the file if it exists. Use remote_edit for surgical
-    in-place edits."""
+    """Atomically write UTF-8 text to a remote path, creating parents."""
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
@@ -202,9 +172,8 @@ async def remote_edit(
     new: str,
     replace_all: bool = False,
 ) -> dict:
-    """Exact-string replacement in a remote file (mirrors Claude's local Edit).
-    Errors if `old` is not present, or if it is non-unique and replace_all is
-    False. Read-modify-write through the visible tmux pane."""
+    """Replace exact text in a remote UTF-8 file; `old` must be unique unless
+    `replace_all=true`."""
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
@@ -234,9 +203,7 @@ async def remote_grep(
     case_insensitive: bool = False,
     max_results: int = 200,
 ) -> dict:
-    """Search for `pattern` (regex) under `path`. Uses ripgrep if available on
-    the remote, falls back to `grep -rE`. Optional `glob` filters file names
-    (e.g. '*.py')."""
+    """Search remote files with ripgrep or grep fallback."""
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
@@ -283,8 +250,7 @@ async def remote_glob(
     path: str = ".",
     max_results: int = 500,
 ) -> dict:
-    """List files matching `pattern` under `path` (uses `find -name`). Pattern
-    is a shell glob like '*.py' or 'test_*.json' — not a full path glob."""
+    """List remote files matching a `find -name` shell glob."""
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
