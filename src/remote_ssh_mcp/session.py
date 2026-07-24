@@ -11,10 +11,13 @@ from dataclasses import dataclass, field
 from os.path import expanduser
 from typing import Optional
 
-from .runner import _tmux, capture_pane, run_in_pane
+from .runner import _tmux, capture_pane, paste_text, run_in_pane
 
 SESSION_PREFIX = "remote-ssh-mcp"
 HOST_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
+SHELL_READY_CAPTURE_LINES = 100
+SHELL_READY_POLL_INTERVAL = 0.5
+SHELL_READY_RETRY_INTERVAL = 2.0
 
 
 def _session_name(host: str) -> str:
@@ -380,43 +383,64 @@ class SessionManager:
     ) -> None:
         """Wait until the remote shell is actually ready to accept commands.
 
-        Naive `sleep N` is fragile (slow networks, slow MOTD). Polling
-        capture-pane for a prompt doesn't work because tmux's `-p` doesn't
-        include the cursor line.
-
-        Trick: send a harmless Enter every 0.5s. While bash is starting,
-        these are absorbed by login scripts or just redraw the not-yet-
-        rendered prompt — no harm. Once bash is the active reader, an
-        empty Enter submits an empty command, redrawing the prompt
-        *below* the previous one. The previous prompt is now in
-        scrollback and visible to capture-pane. We detect a prompt-like
-        line and stop.
+        Prompt text is not a reliable readiness signal: it may contain any
+        characters, span multiple lines, or change dynamically. Instead, send
+        a harmless command whose output contains a unique marker. The marker
+        is split across arguments in the typed command, so terminal echo alone
+        cannot be mistaken for successful execution.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
-
-        # Wait briefly for SSH banner to start streaming.
-        await asyncio.sleep(0.5)
-
-        prompt_re = re.compile(r"[\$#>❯»]\s*$", re.MULTILINE)
+        marker = secrets.token_hex(8)
+        expected = f"__RSM_READY_{marker}__"
+        probe = f"printf '%s%s\\n' '__RSM_READY_' '{marker}__'"
+        next_probe_at = loop.time()
+        last_screen = ""
 
         while loop.time() < deadline:
-            await _tmux("send-keys", "-t", pane_id, "Enter")
-            await asyncio.sleep(0.5)
-            screen = await capture_pane(pane_id)
-            non_empty = [ln for ln in screen.splitlines() if ln.strip()]
-            if non_empty:
-                last = non_empty[-1].rstrip()
-                if prompt_re.search(last):
-                    return
+            if loop.time() >= next_probe_at:
+                try:
+                    await paste_text(pane_id, probe)
+                except RuntimeError as exc:
+                    raise SessionError(
+                        f"SSH login to {host!r} could not send the shell "
+                        f"readiness probe: {exc}"
+                    ) from exc
+                next_probe_at = loop.time() + SHELL_READY_RETRY_INTERVAL
 
-        screen = await capture_pane(pane_id)
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(SHELL_READY_POLL_INTERVAL, remaining))
+
+            try:
+                last_screen = await capture_pane(
+                    pane_id, lines=SHELL_READY_CAPTURE_LINES
+                )
+            except RuntimeError as exc:
+                raise SessionError(
+                    f"SSH login to {host!r} could not inspect its tmux pane "
+                    f"while waiting for shell readiness: {exc}"
+                ) from exc
+            if expected in last_screen:
+                return
+
+        if not last_screen:
+            try:
+                last_screen = await capture_pane(
+                    pane_id, lines=SHELL_READY_CAPTURE_LINES
+                )
+            except RuntimeError as exc:
+                raise SessionError(
+                    f"SSH login to {host!r} could not inspect its tmux pane "
+                    f"while waiting for shell readiness: {exc}"
+                ) from exc
+
         raise SessionError(
-            f"SSH login to {host!r} did not yield a usable shell within "
-            f"{timeout:.0f}s. The prompt is expected to end in `$`, `#`, "
-            f"`>`, `❯`, or `»`; if your shell uses something else, set a "
-            f"more conventional PS1 in your remote shell rc. Last pane:\n"
-            f"{screen[-1500:]}"
+            f"SSH login to {host!r} did not yield a shell that could execute "
+            f"the readiness probe within {timeout:.0f}s. The remote login may "
+            f"be stuck in startup scripts or an interactive program. "
+            f"Last pane:\n{last_screen[-1500:]}"
         )
 
     async def _configure_history(self, session: str) -> None:
