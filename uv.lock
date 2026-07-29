@@ -629,7 +629,7 @@ wheels = [
 
 [[package]]
 name = "remote-ssh-mcp"
-version = "0.3.1"
+version = "0.3.2"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
@@ -643,7 +643,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", specifier = ">=1.2.0" }]
+requires-dist = [{ name = "mcp", specifier = ">=1.2.0,<3" }]
 
 [package.metadata.requires-dev]
 dev = [

@@ -1,0 +1,47 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    name: MCP SDK ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: minimum-v1
+            requirement: mcp==1.2.0
+          - name: latest-v1
+            requirement: mcp>=1.2,<2
+          - name: latest-v2
+            requirement: mcp>=2,<3
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
+        with:
+          python-version: "3.12"
+      - name: Run tests
+        run: >-
+          uv run --isolated --no-project
+          --with-editable .
+          --with pytest
+          --with pytest-asyncio
+          --with '${{ matrix.requirement }}'
+          pytest -q
+
+  quality:
+    name: Quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v9
+        with:
+          python-version: "3.12"
+      - run: uv lock --check
+      - run: uv run --frozen ruff check .

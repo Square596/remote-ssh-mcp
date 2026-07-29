@@ -6,8 +6,7 @@ from __future__ import annotations
 import shlex
 from typing import Optional
 
-from mcp.server.fastmcp import FastMCP
-
+from ._mcp_compat import MCPServer
 from .files import (
     MAX_READ_BYTES,
     FileOpError,
@@ -18,7 +17,7 @@ from .files import (
 from .runner import run_in_pane
 from .session import SessionError, SessionManager
 
-mcp = FastMCP("remote-ssh-mcp")
+mcp = MCPServer("remote-ssh-mcp")
 sessions = SessionManager()
 
 

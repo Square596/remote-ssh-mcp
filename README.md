@@ -104,7 +104,7 @@ the auto-updating stdio server directly:
       "command": "sh",
       "args": [
         "-lc",
-        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade --with 'mcp<2' git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
       ],
       "env_vars": ["SSH_AUTH_SOCK"]
     }
@@ -119,8 +119,19 @@ itself to be launched from an environment where `SSH_AUTH_SOCK` is set.
 You can also install the Python package directly as a stable uv-managed tool:
 
 ```bash
-uv tool install git+https://github.com/Square596/remote-ssh-mcp
+uv tool install --with 'mcp<2' git+https://github.com/Square596/remote-ssh-mcp
 ```
+
+The bundled and recommended install commands currently select the mature MCP
+SDK 1.x line. The server also supports MCP SDK 2.x. To opt in, use the manual
+MCP server configuration below and install with:
+
+```bash
+uv tool install --reinstall --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp
+```
+
+Do not combine this opt-in with the bundled auto-updating configuration, which
+deliberately restores the SDK 1.x constraint on startup.
 
 Then add the installed command to your MCP client config:
 

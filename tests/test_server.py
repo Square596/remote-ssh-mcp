@@ -13,6 +13,23 @@ def tool_fn(tool):
 
 
 @pytest.mark.asyncio
+async def test_mcp_registers_expected_tools() -> None:
+    tools = await server.mcp.list_tools()
+
+    assert {tool.name for tool in tools} == {
+        "remote_connect",
+        "remote_disconnect",
+        "remote_edit",
+        "remote_glob",
+        "remote_grep",
+        "remote_read",
+        "remote_run",
+        "remote_status",
+        "remote_write",
+    }
+
+
+@pytest.mark.asyncio
 async def test_remote_run_rejects_empty_command() -> None:
     result = await tool_fn(server.remote_run)(connection_id="unused", cmd=" \t")
 
