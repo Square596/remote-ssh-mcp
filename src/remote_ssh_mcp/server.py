@@ -143,6 +143,16 @@ async def remote_read(
     limit: int = MAX_READ_BYTES,
 ) -> dict:
     """Read up to 1 MB from a remote file. Use `offset`/`limit` for chunks."""
+    if offset < 0:
+        return _err("offset must be >= 0.")
+    if limit <= 0:
+        return _err("limit must be > 0.")
+    if limit > MAX_READ_BYTES:
+        return _err(
+            f"limit={limit} exceeds max {MAX_READ_BYTES}; read larger files in "
+            "pieces using offset/limit."
+        )
+
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
@@ -191,6 +201,11 @@ async def remote_edit(
 ) -> dict:
     """Replace exact text in a remote UTF-8 file; `old` must be unique unless
     `replace_all=true`."""
+    if old == "":
+        return _err("old must not be empty.")
+    if old == new:
+        return _err("old and new are identical — nothing to do.")
+
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:

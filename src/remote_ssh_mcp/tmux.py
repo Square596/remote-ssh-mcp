@@ -39,7 +39,7 @@ async def tmux(
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
-    except TimeoutError:
+    except (TimeoutError, asyncio.TimeoutError):
         if proc.returncode is None:
             proc.kill()
         await proc.wait()

@@ -252,8 +252,8 @@ async def test_connect_failure_cleans_up_created_window(monkeypatch) -> None:
     async def fake_preflight(*args, **kwargs):
         return PreflightResult()
 
-    async def fake_session_exists(*args, **kwargs):
-        return False
+    async def fake_session_target(*args, **kwargs):
+        return None
 
     async def fake_new_session(*args, **kwargs):
         return "@1", "%1"
@@ -268,7 +268,7 @@ async def test_connect_failure_cleans_up_created_window(monkeypatch) -> None:
         cleaned.append(window_id)
 
     monkeypatch.setattr(sm, "_preflight", fake_preflight)
-    monkeypatch.setattr(sm, "_session_exists", fake_session_exists)
+    monkeypatch.setattr(sm, "_session_target", fake_session_target)
     monkeypatch.setattr(sm, "_new_session", fake_new_session)
     monkeypatch.setattr(sm, "_configure_history", fake_configure_history)
     monkeypatch.setattr(sm, "_wait_for_shell", fake_wait)
@@ -290,7 +290,7 @@ async def test_new_session_configures_history_before_real_pane(monkeypatch) -> N
     async def fake_tmux(*args, **kwargs):
         calls.append(args)
         if args[0] == "new-session":
-            return 0, b"@0 %0", b""
+            return 0, b"$3 @0 %0", b""
         if args[0] == "new-window":
             return 0, b"@1 %1", b""
         return 0, b"", b""
@@ -311,7 +311,26 @@ async def test_new_session_configures_history_before_real_pane(monkeypatch) -> N
         "new-window",
     ]
     assert calls[1][-2:] == ("history-limit", str(PANE_HISTORY_LIMIT))
+    assert calls[1][1:3] == ("-t", "$3")
+    assert calls[2][1:3] == ("-t", "$3:")
     assert killed == ["@0"]
+
+
+@pytest.mark.asyncio
+async def test_session_target_matches_full_name_not_prefix(monkeypatch) -> None:
+    async def fake_tmux(*args, **kwargs):
+        assert args == ("list-sessions", "-F", "#{session_id}\t#{session_name}")
+        return (
+            0,
+            b"$1\tremote-ssh-mcp/prod-eu\n$2\tremote-ssh-mcp/prod\n",
+            b"",
+        )
+
+    monkeypatch.setattr("remote_ssh_mcp.session.tmux", fake_tmux)
+
+    target = await SessionManager()._session_target("remote-ssh-mcp/prod")
+
+    assert target == "$2"
 
 
 @pytest.mark.asyncio

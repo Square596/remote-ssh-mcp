@@ -260,8 +260,8 @@ async def test_connect_omits_agent_forwarding_from_session_command(
             forwarded_agent_present=False,
         )
 
-    async def fake_session_exists(*args, **kwargs):
-        return False
+    async def fake_session_target(*args, **kwargs):
+        return None
 
     async def fake_new_session(session, label, cmd):
         session_cmds.append(cmd)
@@ -277,7 +277,7 @@ async def test_connect_omits_agent_forwarding_from_session_command(
         return SimpleNamespace(stdout=f"{tmp_path / 'cwd'}\n", exit_code=0)
 
     monkeypatch.setattr(sm, "_preflight", fake_preflight)
-    monkeypatch.setattr(sm, "_session_exists", fake_session_exists)
+    monkeypatch.setattr(sm, "_session_target", fake_session_target)
     monkeypatch.setattr(sm, "_new_session", fake_new_session)
     monkeypatch.setattr(sm, "_configure_history", fake_configure_history)
     monkeypatch.setattr(sm, "_wait_for_shell", fake_wait_for_shell)

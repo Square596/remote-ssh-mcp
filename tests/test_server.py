@@ -166,6 +166,42 @@ async def test_remote_grep_rejects_non_positive_max_results(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_invalid_read_does_not_start_recovering_operation(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            raise AssertionError("connection lookup must not run")
+
+        def operation(self, *args, **kwargs):
+            raise AssertionError("operation must not start")
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    result = await tool_fn(server.remote_read)(
+        connection_id="conn", path="file.txt", offset=-1
+    )
+
+    assert result == {"ok": False, "error": "offset must be >= 0."}
+
+
+@pytest.mark.asyncio
+async def test_invalid_edit_does_not_start_recovering_operation(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            raise AssertionError("connection lookup must not run")
+
+        def operation(self, *args, **kwargs):
+            raise AssertionError("operation must not start")
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    result = await tool_fn(server.remote_edit)(
+        connection_id="conn", path="file.txt", old="", new="replacement"
+    )
+
+    assert result == {"ok": False, "error": "old must not be empty."}
+
+
+@pytest.mark.asyncio
 async def test_remote_write_success_response_stays_stable(monkeypatch) -> None:
     class FakeSessions(OperationSessions):
         def get(self, connection_id):

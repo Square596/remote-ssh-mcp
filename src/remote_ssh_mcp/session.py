@@ -136,9 +136,12 @@ class SessionManager:
             # Only tmux session/window creation needs cross-connection
             # serialization. Login readiness can proceed independently per pane.
             async with self._connect_lock:
-                if await self._session_exists(session):
-                    await self._configure_history(session)
-                    window_id, pane_id = await self._new_window(session, label, ssh_cmd)
+                session_target = await self._session_target(session)
+                if session_target is not None:
+                    await self._configure_history(session_target)
+                    window_id, pane_id = await self._new_window(
+                        session_target, label, ssh_cmd
+                    )
                 else:
                     window_id, pane_id = await self._new_session(
                         session, label, ssh_cmd
@@ -337,7 +340,7 @@ class SessionManager:
     ) -> tuple[bytes, bytes]:
         try:
             return await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             if proc.returncode is None:
                 proc.kill()
             await proc.wait()
@@ -362,7 +365,7 @@ class SessionManager:
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             proc.kill()
             await proc.wait()
             if paths:
@@ -426,9 +429,29 @@ class SessionManager:
         ]
         return "\n".join(parts) if parts else None
 
-    async def _session_exists(self, session: str) -> bool:
-        rc, _, _ = await tmux("has-session", "-t", session)
-        return rc == 0
+    async def _session_target(self, session: str) -> str | None:
+        """Return the exact tmux session id for a name, never a prefix match."""
+        rc, out, err = await tmux(
+            "list-sessions", "-F", "#{session_id}\t#{session_name}"
+        )
+        if rc != 0:
+            message = err.decode(errors="replace").strip()
+            if any(
+                detail in message
+                for detail in (
+                    "no server running",
+                    "failed to connect to server",
+                    "error connecting to",
+                )
+            ):
+                return None
+            raise SessionError(f"tmux session lookup failed: {message}")
+
+        for line in out.decode(errors="replace").splitlines():
+            session_id, separator, session_name = line.partition("\t")
+            if separator and session_name == session:
+                return session_id
+        return None
 
     async def _new_session(self, session: str, label: str, cmd: str) -> tuple[str, str]:
         rc, out, err = await tmux(
@@ -444,19 +467,19 @@ class SessionManager:
             "50",
             "-P",
             "-F",
-            "#{window_id} #{pane_id}",
+            "#{session_id} #{window_id} #{pane_id}",
         )
         if rc != 0:
             raise SessionError(
                 f"tmux new-session failed: {err.decode(errors='replace')}"
             )
-        bootstrap_window, _ = out.decode().strip().split()
+        session_target, bootstrap_window, _ = out.decode().strip().split()
         window_id: str | None = None
         try:
             # tmux snapshots history-limit when a pane is created. Establish
             # the session option before creating the real SSH pane.
-            await self._configure_history(session)
-            window_id, pane_id = await self._new_window(session, label, cmd)
+            await self._configure_history(session_target)
+            window_id, pane_id = await self._new_window(session_target, label, cmd)
             await self._cleanup_window(bootstrap_window)
             return window_id, pane_id
         except BaseException:
@@ -465,11 +488,13 @@ class SessionManager:
             await asyncio.shield(self._cleanup_window(bootstrap_window))
             raise
 
-    async def _new_window(self, session: str, label: str, cmd: str) -> tuple[str, str]:
+    async def _new_window(
+        self, session_target: str, label: str, cmd: str
+    ) -> tuple[str, str]:
         rc, out, err = await tmux(
             "new-window",
             "-t",
-            f"{session}:",
+            f"{session_target}:",
             "-n",
             label,
             "-P",
@@ -549,12 +574,12 @@ class SessionManager:
             f"Last pane:\n{last_screen[-1500:]}"
         )
 
-    async def _configure_history(self, session: str) -> None:
+    async def _configure_history(self, session_target: str) -> None:
         # Bigger history makes large `remote_read` outputs survivable.
         rc, _, err = await tmux(
             "set-option",
             "-t",
-            session,
+            session_target,
             "history-limit",
             str(PANE_HISTORY_LIMIT),
         )

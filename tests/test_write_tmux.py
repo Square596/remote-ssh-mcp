@@ -98,6 +98,41 @@ def _payload(size: int) -> bytes:
 
 
 @pytest.mark.asyncio
+async def test_session_lookup_is_exact_for_prefix_names() -> None:
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux is required")
+
+    stem = f"rsm-prefix-{uuid.uuid4().hex[:10]}"
+    names = (stem, f"{stem}-extended")
+    try:
+        for name in reversed(names):
+            subprocess.run(
+                [tmux, "new-session", "-d", "-s", name],
+                check=True,
+                capture_output=True,
+            )
+
+        target = await SessionManager()._session_target(stem)
+        assert target is not None
+        resolved = subprocess.run(
+            [tmux, "display-message", "-p", "-t", target, "#{session_name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert resolved.stdout.strip() == stem
+    finally:
+        for name in names:
+            subprocess.run(
+                [tmux, "kill-session", "-t", name],
+                check=False,
+                capture_output=True,
+            )
+
+
+@pytest.mark.asyncio
 async def test_multiline_run_supports_heredocs_and_preserves_state(tmux_pane, tmp_path):
     shell, pane_id = tmux_pane
     command = (
