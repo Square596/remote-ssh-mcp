@@ -84,9 +84,8 @@ async def remote_status() -> dict:
 
 @mcp.tool()
 async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
-    """Run shell commands in the persistent remote session. Multi-line scripts
-    and heredocs are supported, and cwd/env state is preserved across calls.
-    """
+    """Run commands in the persistent remote shell while preserving cwd and
+    environment state across calls."""
     if not cmd.strip():
         return _err("remote_run rejects empty commands.")
     if "\x00" in cmd:
