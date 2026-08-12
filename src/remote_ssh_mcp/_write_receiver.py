@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import termios
@@ -174,10 +175,50 @@ class WriteReceiver:
         if self.actual_sha256 != self.expected_sha256:
             raise ValueError("sha256 mismatch")
 
+    def destination_snapshot(self):
+        try:
+            entry = os.lstat(self.path)
+        except FileNotFoundError:
+            return {
+                "kind": "missing",
+                "destination": self.path,
+            }
+
+        identity = (entry.st_dev, entry.st_ino)
+        if stat.S_ISLNK(entry.st_mode):
+            return {
+                "kind": "symlink",
+                "identity": identity,
+                "link": os.readlink(self.path),
+                "destination": os.path.realpath(self.path),
+            }
+        return {
+            "kind": "entry",
+            "identity": identity,
+            "destination": self.path,
+        }
+
+    def destination_matches(self, snapshot):
+        try:
+            entry = os.lstat(self.path)
+        except FileNotFoundError:
+            return snapshot["kind"] == "missing"
+
+        if snapshot["kind"] == "missing":
+            return False
+        if (entry.st_dev, entry.st_ino) != snapshot["identity"]:
+            return False
+        if snapshot["kind"] == "symlink":
+            return (
+                stat.S_ISLNK(entry.st_mode)
+                and os.readlink(self.path) == snapshot["link"]
+                and os.path.realpath(self.path) == snapshot["destination"]
+            )
+        return not stat.S_ISLNK(entry.st_mode)
+
     def commit_payload(self):
-        destination = (
-            os.path.realpath(self.path) if os.path.islink(self.path) else self.path
-        )
+        snapshot = self.destination_snapshot()
+        destination = snapshot["destination"]
         directory = os.path.dirname(os.path.abspath(destination)) or "."
         os.makedirs(directory, exist_ok=True)
         try:
@@ -196,10 +237,22 @@ class WriteReceiver:
                 target.flush()
                 os.fchmod(target.fileno(), mode)
                 os.fsync(target.fileno())
-            self.replace_started = True
-            os.replace(self.destination_tmp, destination)
+
+            if not self.destination_matches(snapshot):
+                raise RuntimeError("destination path changed during write")
+
+            if snapshot["kind"] == "missing":
+                os.link(self.destination_tmp, destination, follow_symlinks=False)
+                self.replace_started = True
+                os.unlink(self.destination_tmp)
+            else:
+                self.replace_started = True
+                os.replace(self.destination_tmp, destination)
             self.destination_tmp = None
             self.committed = True
+
+            if snapshot["kind"] == "symlink" and not self.destination_matches(snapshot):
+                raise RuntimeError("destination symlink changed during write")
         finally:
             self.remove(self.destination_tmp)
 
