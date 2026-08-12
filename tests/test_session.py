@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from remote_ssh_mcp.runner import RunResult
+from remote_ssh_mcp.runner import PANE_HISTORY_LIMIT, RunResult
 from remote_ssh_mcp.session import (
     Connection,
     PreflightResult,
@@ -135,6 +135,26 @@ async def test_operation_exposes_busy_state_and_records_failure() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recovering_operation_marks_failed_pane_unresponsive(monkeypatch) -> None:
+    sm = SessionManager()
+    conn = make_connection()
+
+    async def fake_recover(pane_id):
+        assert pane_id == "%1"
+        return False
+
+    monkeypatch.setattr("remote_ssh_mcp.session.recover_pane", fake_recover)
+
+    with pytest.raises(RuntimeError, match="read failed"):
+        async with sm.operation(conn, "read", recover_on_failure=True):
+            raise RuntimeError("read failed")
+
+    assert conn.state == "unresponsive"
+    assert conn.current_operation is None
+    assert conn.last_error == "read failed: read failed"
+
+
+@pytest.mark.asyncio
 async def test_run_timeout_recovers_pane_and_updates_status(monkeypatch) -> None:
     sm = SessionManager()
     conn = make_connection(cwd="/before")
@@ -259,6 +279,39 @@ async def test_connect_failure_cleans_up_created_window(monkeypatch) -> None:
 
     assert cleaned == ["@1"]
     assert sm.list_connections() == []
+
+
+@pytest.mark.asyncio
+async def test_new_session_configures_history_before_real_pane(monkeypatch) -> None:
+    sm = SessionManager()
+    calls: list[tuple[str, ...]] = []
+    killed: list[str] = []
+
+    async def fake_tmux(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "new-session":
+            return 0, b"@0 %0", b""
+        if args[0] == "new-window":
+            return 0, b"@1 %1", b""
+        return 0, b"", b""
+
+    async def fake_kill(window_id):
+        killed.append(window_id)
+        return True
+
+    monkeypatch.setattr("remote_ssh_mcp.session.tmux", fake_tmux)
+    monkeypatch.setattr("remote_ssh_mcp.session.kill_window", fake_kill)
+
+    result = await sm._new_session("remote-ssh-mcp/host", "work", "ssh host")
+
+    assert result == ("@1", "%1")
+    assert [call[0] for call in calls] == [
+        "new-session",
+        "set-option",
+        "new-window",
+    ]
+    assert calls[1][-2:] == ("history-limit", str(PANE_HISTORY_LIMIT))
+    assert killed == ["@0"]
 
 
 @pytest.mark.asyncio

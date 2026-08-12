@@ -13,7 +13,7 @@ import pytest
 
 from remote_ssh_mcp import files
 from remote_ssh_mcp.files import FileOpError, write_remote_file
-from remote_ssh_mcp.runner import capture_pane, run_in_pane
+from remote_ssh_mcp.runner import PANE_HISTORY_LIMIT, capture_pane, run_in_pane
 from remote_ssh_mcp.session import Connection, SessionManager
 
 pytestmark = pytest.mark.skipif(
@@ -31,7 +31,7 @@ def tmux_pane(request):
 
     session = f"rsm-write-test-{uuid.uuid4().hex[:10]}"
     shell_args = ["-f"] if request.param == "zsh" else ["--noprofile", "--norc"]
-    proc = subprocess.run(
+    subprocess.run(
         [
             tmux,
             "new-session",
@@ -43,6 +43,30 @@ def tmux_pane(request):
             "-y",
             "50",
             "-P",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            tmux,
+            "set-option",
+            "-t",
+            session,
+            "history-limit",
+            str(PANE_HISTORY_LIMIT),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    proc = subprocess.run(
+        [
+            tmux,
+            "new-window",
+            "-d",
+            "-t",
+            f"{session}:",
+            "-P",
             "-F",
             "#{pane_id}",
             shell,
@@ -53,6 +77,11 @@ def tmux_pane(request):
         text=True,
     )
     pane_id = proc.stdout.strip()
+    subprocess.run(
+        [tmux, "kill-window", "-t", f"{session}:0"],
+        check=True,
+        capture_output=True,
+    )
     try:
         yield request.param, pane_id
     finally:
@@ -125,6 +154,49 @@ async def test_timed_out_run_recovers_shell(tmux_pane):
 
     assert result.timed_out is True, (shell, result.stdout)
     assert result.pane_recovered is True, (shell, result.stdout)
+    assert conn.state == "ready"
+    assert probe.stdout == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_run_preserves_framing_beyond_previous_history_limit(tmux_pane):
+    shell, pane_id = tmux_pane
+    command = "python3 -c 'import sys; sys.stdout.write(\"x\\n\" * 100001)'"
+
+    result = await run_in_pane(pane_id, command, timeout=15)
+
+    assert result.exit_code == 0, (shell, result.stdout[-1000:])
+    assert len(result.stdout.splitlines()) == 100001
+
+
+@pytest.mark.asyncio
+async def test_timed_out_file_read_recovers_shell(tmux_pane, tmp_path, monkeypatch):
+    shell, pane_id = tmux_pane
+    fifo = tmp_path / "blocked-read"
+    os.mkfifo(fifo)
+    real_run = files.run_in_pane
+    conn = Connection(
+        connection_id="test",
+        host="local-test",
+        session_name="test",
+        window_id="@test",
+        pane_id=pane_id,
+        project_path=None,
+        label="test",
+    )
+
+    async def capped_run(pane, command, timeout=60):
+        return await real_run(pane, command, timeout=min(timeout, 0.2))
+
+    monkeypatch.setattr(files, "run_in_pane", capped_run)
+    manager = SessionManager()
+
+    with pytest.raises(FileOpError) as exc_info:
+        async with manager.operation(conn, "read", recover_on_failure=True):
+            await files.read_remote_file(pane_id, str(fifo))
+
+    probe = await real_run(pane_id, "printf recovered", timeout=5)
+    assert exc_info.value.details["pane_recovered"] is True, shell
     assert conn.state == "ready"
     assert probe.stdout == "recovered"
 

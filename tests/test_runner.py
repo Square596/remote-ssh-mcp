@@ -137,6 +137,25 @@ def test_wrap_command_rejects_nul_character() -> None:
         _wrap_command("abc123", "printf 'before'\x00printf 'after'")
 
 
+def test_wrap_command_framing_cannot_be_clobbered_by_user_variables() -> None:
+    wrapped = _wrap_command(
+        "left",
+        "RSM_A=clobber; RSM_B=clobber; __rsm_rc=clobber; printf done",
+        marker_right="right",
+    )
+
+    proc = subprocess.run(
+        ["bash", "-fc", wrapped],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert "__RSM_BEGIN_leftright__" in proc.stdout
+    assert "__RSM_END_leftright_0__" in proc.stdout
+    assert "__RSM_CWD_leftright__" in proc.stdout
+
+
 @pytest.mark.asyncio
 async def test_run_rejects_non_positive_deadlines_before_paste(monkeypatch) -> None:
     async def unexpected_paste(*args, **kwargs):

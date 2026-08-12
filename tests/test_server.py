@@ -16,7 +16,7 @@ def tool_fn(tool):
 
 class OperationSessions:
     @asynccontextmanager
-    async def operation(self, conn, name):
+    async def operation(self, conn, name, **kwargs):
         async with conn.lock:
             yield conn
 

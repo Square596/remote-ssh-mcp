@@ -148,13 +148,15 @@ async def remote_read(
     except SessionError as e:
         return _err(str(e))
 
-    async with sessions.operation(conn, "read"):
-        try:
+    try:
+        async with sessions.operation(conn, "read", recover_on_failure=True):
             data, total = await read_remote_file(
                 conn.pane_id, path, offset=offset, limit=limit
             )
-        except FileOpError as e:
-            return _err(str(e), **e.details)
+    except FileOpError as e:
+        return _err(str(e), **e.details)
+    except SessionError as e:
+        return _err(str(e))
 
     text = data.decode("utf-8", errors="replace")
     return _ok(content=text, byte_size=len(data), total_size=total, offset=offset)
@@ -168,11 +170,13 @@ async def remote_write(connection_id: str, path: str, content: str) -> dict:
     except SessionError as e:
         return _err(str(e))
 
-    async with sessions.operation(conn, "write"):
-        try:
+    try:
+        async with sessions.operation(conn, "write", recover_on_failure=True):
             n = await write_remote_file(conn.pane_id, path, content.encode("utf-8"))
-        except FileOpError as e:
-            return _err(str(e), **e.details)
+    except FileOpError as e:
+        return _err(str(e), **e.details)
+    except SessionError as e:
+        return _err(str(e))
 
     return _ok(path=path, bytes_written=n)
 
@@ -192,13 +196,15 @@ async def remote_edit(
     except SessionError as e:
         return _err(str(e))
 
-    async with sessions.operation(conn, "edit"):
-        try:
+    try:
+        async with sessions.operation(conn, "edit", recover_on_failure=True):
             res = await edit_remote_file(
                 conn.pane_id, path, old=old, new=new, replace_all=replace_all
             )
-        except FileOpError as e:
-            return _err(str(e), **e.details)
+    except FileOpError as e:
+        return _err(str(e), **e.details)
+    except SessionError as e:
+        return _err(str(e))
 
     return _ok(
         path=res.path,

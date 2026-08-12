@@ -12,7 +12,8 @@ from dataclasses import dataclass
 from .tmux import capture_pane, paste_text, send_keys
 
 RUN_POLL_CAPTURE_LINES = 200
-RUN_FINAL_CAPTURE_LINES = 100_000
+PANE_HISTORY_LIMIT = 1_100_000
+RUN_FINAL_CAPTURE_LINES = PANE_HISTORY_LIMIT
 PANE_RECOVERY_TIMEOUT = 8.0
 
 
@@ -115,14 +116,13 @@ def _wrap_command(
         raise ValueError("remote command must not be empty")
 
     return (
-        f"RSM_A={shlex.quote(marker)}; RSM_B={shlex.quote(marker_right)}; "
-        f"printf '%s%s%s%s\\n' '__RSM_BEGIN_' \"$RSM_A\" \"$RSM_B\" '__'; "
-        f"__rsm_cmd={shlex.quote(normalized_cmd)}; "
-        f'eval "$__rsm_cmd"; '
-        f"__rsm_rc=$?; "
-        f"printf '\\n%s%s%s_%s%s\\n' '__RSM_END_' \"$RSM_A\" \"$RSM_B\" "
-        f'"$__rsm_rc" "__"; '
-        f"printf '%s%s%s%s %s\\n' '__RSM_CWD_' \"$RSM_A\" \"$RSM_B\" '__' \"$PWD\""
+        f"printf '%s%s%s%s\\n' '__RSM_BEGIN_' {shlex.quote(marker)} "
+        f"{shlex.quote(marker_right)} '__'; "
+        f"eval {shlex.quote(normalized_cmd)}; "
+        f"printf '\\n%s%s%s_%s%s\\n' '__RSM_END_' {shlex.quote(marker)} "
+        f'{shlex.quote(marker_right)} "$?" "__"; '
+        f"printf '%s%s%s%s %s\\n' '__RSM_CWD_' {shlex.quote(marker)} "
+        f"{shlex.quote(marker_right)} '__' \"$PWD\""
     )
 
 

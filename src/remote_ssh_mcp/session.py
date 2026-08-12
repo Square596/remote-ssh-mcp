@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from os.path import expanduser
 from typing import AsyncIterator, Literal, Optional
 
-from .runner import RunResult, recover_pane, run_in_pane
+from .runner import PANE_HISTORY_LIMIT, RunResult, recover_pane, run_in_pane
 from .tmux import TmuxError, capture_pane, kill_window, paste_text, tmux
 
 SESSION_PREFIX = "remote-ssh-mcp"
@@ -137,12 +137,12 @@ class SessionManager:
             # serialization. Login readiness can proceed independently per pane.
             async with self._connect_lock:
                 if await self._session_exists(session):
+                    await self._configure_history(session)
                     window_id, pane_id = await self._new_window(session, label, ssh_cmd)
                 else:
                     window_id, pane_id = await self._new_session(
                         session, label, ssh_cmd
                     )
-                await self._configure_history(session)
 
             await self._wait_for_shell(pane_id, host)
 
@@ -427,7 +427,7 @@ class SessionManager:
         return "\n".join(parts) if parts else None
 
     async def _session_exists(self, session: str) -> bool:
-        rc, _, _ = await tmux("has-session", "-t", f"={session}")
+        rc, _, _ = await tmux("has-session", "-t", session)
         return rc == 0
 
     async def _new_session(self, session: str, label: str, cmd: str) -> tuple[str, str]:
@@ -437,7 +437,7 @@ class SessionManager:
             "-s",
             session,
             "-n",
-            label,
+            "__bootstrap__",
             "-x",
             "220",
             "-y",
@@ -445,20 +445,31 @@ class SessionManager:
             "-P",
             "-F",
             "#{window_id} #{pane_id}",
-            cmd,
         )
         if rc != 0:
             raise SessionError(
                 f"tmux new-session failed: {err.decode(errors='replace')}"
             )
-        window_id, pane_id = out.decode().strip().split()
-        return window_id, pane_id
+        bootstrap_window, _ = out.decode().strip().split()
+        window_id: str | None = None
+        try:
+            # tmux snapshots history-limit when a pane is created. Establish
+            # the session option before creating the real SSH pane.
+            await self._configure_history(session)
+            window_id, pane_id = await self._new_window(session, label, cmd)
+            await self._cleanup_window(bootstrap_window)
+            return window_id, pane_id
+        except BaseException:
+            if window_id is not None:
+                await asyncio.shield(self._cleanup_window(window_id))
+            await asyncio.shield(self._cleanup_window(bootstrap_window))
+            raise
 
     async def _new_window(self, session: str, label: str, cmd: str) -> tuple[str, str]:
         rc, out, err = await tmux(
             "new-window",
             "-t",
-            f"={session}:",
+            f"{session}:",
             "-n",
             label,
             "-P",
@@ -540,10 +551,26 @@ class SessionManager:
 
     async def _configure_history(self, session: str) -> None:
         # Bigger history makes large `remote_read` outputs survivable.
-        await tmux("set-option", "-t", f"={session}", "history-limit", "100000")
+        rc, _, err = await tmux(
+            "set-option",
+            "-t",
+            session,
+            "history-limit",
+            str(PANE_HISTORY_LIMIT),
+        )
+        if rc != 0:
+            raise SessionError(
+                f"tmux history configuration failed: {err.decode(errors='replace')}"
+            )
 
     @asynccontextmanager
-    async def operation(self, conn: Connection, name: str) -> AsyncIterator[Connection]:
+    async def operation(
+        self,
+        conn: Connection,
+        name: str,
+        *,
+        recover_on_failure: bool = False,
+    ) -> AsyncIterator[Connection]:
         """Serialize one pane operation and publish its lifecycle in status."""
         async with conn.lock:
             self._ensure_usable(conn)
@@ -554,11 +581,24 @@ class SessionManager:
             try:
                 yield conn
             except asyncio.CancelledError:
-                if conn.last_error is None:
-                    self._record_error(conn, f"{name} was cancelled")
+                message = f"{name} was cancelled"
+                if recover_on_failure:
+                    recovered = await asyncio.shield(recover_pane(conn.pane_id))
+                    self._record_recovery(conn, recovered, message)
+                elif conn.last_error is None:
+                    self._record_error(conn, message)
                 raise
             except Exception as exc:
-                self._record_error(conn, str(exc))
+                if recover_on_failure:
+                    details = getattr(exc, "details", {})
+                    recovered = details.get("pane_recovered")
+                    if not isinstance(recovered, bool):
+                        recovered = await recover_pane(conn.pane_id)
+                        if isinstance(details, dict):
+                            details["pane_recovered"] = recovered
+                    self._record_recovery(conn, recovered, f"{name} failed: {exc}")
+                else:
+                    self._record_error(conn, str(exc))
                 raise
             finally:
                 conn.current_operation = None
