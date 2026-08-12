@@ -87,10 +87,10 @@ async def main(host: str, work_dir: str, second_dir: str, missing_dir: str) -> i
     if data != payload:
         failures.append(f"roundtrip mismatch:\n  wrote: {payload!r}\n  read:  {data!r}")
 
-    step("remote_write: medium binary (random 200 KB)")
+    step("remote_write: binary roundtrip (random 1 MB)")
     import os as _os
 
-    blob = _os.urandom(200_000)
+    blob = _os.urandom(1_000_000)
     medium_path = remote_path(work_dir, "rsm_smoke_blob.bin")
     await write_remote_file(conn.pane_id, medium_path, blob)
     data, total = await read_remote_file(conn.pane_id, medium_path)
@@ -100,6 +100,31 @@ async def main(host: str, work_dir: str, second_dir: str, missing_dir: str) -> i
         )
     else:
         print(f"binary blob roundtrip OK ({len(blob)} bytes)")
+
+    step("remote_write: verified large transfer (random 5 MB)")
+    import hashlib as _hashlib
+
+    large_blob = _os.urandom(5_000_000)
+    large_path = remote_path(work_dir, "rsm_smoke_large_blob.bin")
+    await write_remote_file(conn.pane_id, large_path, large_blob)
+    expected_sha256 = _hashlib.sha256(large_blob).hexdigest()
+    verify_code = (
+        "import hashlib; "
+        f"p={large_path!r}; "
+        "print(hashlib.sha256(open(p,'rb').read()).hexdigest())"
+    )
+    verified = await run_in_pane(
+        conn.pane_id,
+        f"python3 -c {shlex.quote(verify_code)}",
+        timeout=120,
+    )
+    if verified.exit_code != 0 or verified.stdout.strip() != expected_sha256:
+        failures.append(
+            "large write verification failed: "
+            f"rc={verified.exit_code} output={verified.stdout!r}"
+        )
+    else:
+        print(f"large write OK ({len(large_blob)} bytes, sha256 verified)")
 
     step("remote_edit: unique replacement")
     await write_remote_file(conn.pane_id, test_path, b"alpha\nbravo\ncharlie\n")

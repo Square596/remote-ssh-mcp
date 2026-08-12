@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from remote_ssh_mcp import server
+from remote_ssh_mcp.files import EditResult, FileOpError
 
 
 def tool_fn(tool):
@@ -87,3 +88,87 @@ async def test_remote_grep_rejects_non_positive_max_results(monkeypatch) -> None
 
     assert result["ok"] is False
     assert "max_results must be > 0" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remote_write_success_response_stays_stable(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            assert connection_id == "conn"
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+    async def fake_write(pane_id, path, content):
+        assert (pane_id, path, content) == ("%1", "file.txt", b"hello")
+        return len(content)
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+    monkeypatch.setattr(server, "write_remote_file", fake_write)
+
+    result = await tool_fn(server.remote_write)(
+        connection_id="conn", path="file.txt", content="hello"
+    )
+
+    assert result == {"ok": True, "path": "file.txt", "bytes_written": 5}
+
+
+@pytest.mark.asyncio
+async def test_remote_write_exposes_diagnostics_only_on_failure(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+    async def fake_write(pane_id, path, content):
+        raise FileOpError(
+            "write verification failed",
+            stage="verify",
+            verified=False,
+            destination_state="unchanged",
+            pane_recovered=True,
+            expected_bytes=5,
+            actual_bytes=4,
+        )
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+    monkeypatch.setattr(server, "write_remote_file", fake_write)
+
+    result = await tool_fn(server.remote_write)(
+        connection_id="conn", path="file.txt", content="hello"
+    )
+
+    assert result == {
+        "ok": False,
+        "error": "write verification failed",
+        "stage": "verify",
+        "verified": False,
+        "destination_state": "unchanged",
+        "pane_recovered": True,
+        "expected_bytes": 5,
+        "actual_bytes": 4,
+    }
+
+
+@pytest.mark.asyncio
+async def test_remote_edit_success_response_stays_stable(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+    async def fake_edit(pane_id, path, old, new, replace_all):
+        return EditResult(path=path, occurrences_replaced=1, bytes_after=8)
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+    monkeypatch.setattr(server, "edit_remote_file", fake_edit)
+
+    result = await tool_fn(server.remote_edit)(
+        connection_id="conn",
+        path="file.txt",
+        old="old",
+        new="new",
+    )
+
+    assert result == {
+        "ok": True,
+        "path": "file.txt",
+        "occurrences_replaced": 1,
+        "bytes_after": 8,
+    }

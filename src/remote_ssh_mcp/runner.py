@@ -23,13 +23,18 @@ import time
 from dataclasses import dataclass
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
+TMUX_IO_TIMEOUT = 15.0
 
 
 def _strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
 
-async def _tmux(*args: str, stdin: bytes | None = None) -> tuple[int, bytes, bytes]:
+async def _tmux(
+    *args: str,
+    stdin: bytes | None = None,
+    timeout: float | None = None,
+) -> tuple[int, bytes, bytes]:
     proc = await asyncio.create_subprocess_exec(
         "tmux",
         *args,
@@ -37,7 +42,22 @@ async def _tmux(*args: str, stdin: bytes | None = None) -> tuple[int, bytes, byt
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    out, err = await proc.communicate(stdin)
+    try:
+        if timeout is None:
+            out, err = await proc.communicate(stdin)
+        else:
+            out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
+    except asyncio.TimeoutError:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        command = " ".join(args[:2])
+        raise RuntimeError(f"tmux {command} timed out after {timeout:g}s") from None
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
+        raise
     return proc.returncode or 0, out, err
 
 
@@ -51,21 +71,68 @@ async def capture_pane(target: str, lines: int = 20000) -> str:
     return _strip_ansi(out.decode("utf-8", errors="replace"))
 
 
-async def paste_text(target: str, text: str, with_enter: bool = True) -> None:
-    """Paste arbitrary text into a pane. Safer than send-keys for long content."""
+async def _load_and_paste(
+    target: str,
+    payload: bytes,
+    *,
+    bracketed: bool,
+    timeout: float = TMUX_IO_TIMEOUT,
+) -> None:
+    """Load bytes into a private tmux buffer and paste them into a pane."""
     buf = f"rsm-{secrets.token_hex(4)}"
-    rc, _, err = await _tmux("load-buffer", "-b", buf, "-", stdin=text.encode("utf-8"))
+
+    async def delete_buffer() -> None:
+        try:
+            await _tmux("delete-buffer", "-b", buf, timeout=timeout)
+        except RuntimeError:
+            pass
+
+    rc, _, err = await _tmux(
+        "load-buffer", "-b", buf, "-", stdin=payload, timeout=timeout
+    )
     if rc != 0:
         raise RuntimeError(f"tmux load-buffer failed: {err.decode(errors='replace')}")
-    rc, _, err = await _tmux("paste-buffer", "-b", buf, "-d", "-t", target)
+
+    args = ["paste-buffer", "-r"]
+    if bracketed:
+        args.append("-p")
+    args.extend(["-b", buf, "-d", "-t", target])
+    try:
+        rc, _, err = await _tmux(*args, timeout=timeout)
+    except asyncio.CancelledError:
+        await asyncio.shield(delete_buffer())
+        raise
+    except Exception:
+        await delete_buffer()
+        raise
     if rc != 0:
+        await delete_buffer()
         raise RuntimeError(f"tmux paste-buffer failed: {err.decode(errors='replace')}")
+
+
+async def paste_text(
+    target: str,
+    text: str,
+    with_enter: bool = True,
+    timeout: float = TMUX_IO_TIMEOUT,
+) -> None:
+    """Paste a shell command using bracketed-paste-aware tmux input."""
+    await _load_and_paste(target, text.encode("utf-8"), bracketed=True, timeout=timeout)
     if with_enter:
-        rc, _, err = await _tmux("send-keys", "-t", target, "Enter")
+        rc, _, err = await _tmux("send-keys", "-t", target, "Enter", timeout=timeout)
         if rc != 0:
             raise RuntimeError(
                 f"tmux send-keys Enter failed: {err.decode(errors='replace')}"
             )
+
+
+async def paste_bytes(
+    target: str,
+    payload: bytes,
+    timeout: float = TMUX_IO_TIMEOUT,
+) -> None:
+    """Paste raw bytes for a program already reading directly from the pane."""
+    await _load_and_paste(target, payload, bracketed=False, timeout=timeout)
 
 
 @dataclass
@@ -87,8 +154,7 @@ async def run_in_pane(
     user_cmd should be a single-line shell snippet (compound commands with
     `;`, `&&`, `||`, pipes are fine). For multi-line scripts, write a file
     via remote_write and execute it. Embedded literal newlines are stripped
-    here because tmux paste-buffer converts them to CR, which interacts
-    badly with pre-login PTY buffering.
+    here so a command cannot be split into separate shell submissions.
     """
     marker = secrets.token_hex(8)
     begin_literal = f"__RSM_BEGIN_{marker}__"

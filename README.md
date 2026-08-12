@@ -40,7 +40,7 @@ serialization and a 1MB cap on single-file reads. See
 - An SSH config entry for the remote host (i.e. `ssh <host>` works in a normal
   terminal). Agent forwarding is requested by default via `ssh -A`; pass
   `agent_forwarding=false` to `remote_connect` to disable it.
-- `python3` on the **remote** host (used for atomic file writes via base64).
+- `python3` on the **remote** host (used for verified, atomic file writes).
 - `uv` on your laptop for the bundled auto-updating plugin config. If you
   install the MCP server manually, `uv` or `pipx` is fine.
 
@@ -214,7 +214,7 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 | `remote_status()` | — | Lists active connections. |
 | `remote_run(connection_id, cmd, timeout?)` | Bash | Persistent shell. Returns `{stdout, exit_code, duration_ms}`. |
 | `remote_read(connection_id, path, offset?, limit?)` | Read | Base64 round-trip through tmux. ≤1 MB. |
-| `remote_write(connection_id, path, content)` | Write | Atomic via tempfile + rename. |
+| `remote_write(connection_id, path, content)` | Write | Streams without terminal echo; verifies size and SHA-256 before atomic replace. |
 | `remote_edit(connection_id, path, old, new, replace_all?)` | Edit | Exact match, errors if `old` is non-unique unless `replace_all=true`. |
 | `remote_grep(connection_id, pattern, path?, glob?)` | Grep | Uses `rg` if available, else `grep -r`. |
 | `remote_glob(connection_id, pattern, path?)` | Glob | Uses `find`. |
@@ -239,10 +239,13 @@ bulk `ssh-add <paths...>` returns non-zero. The response includes the expanded
 `ssh_add_paths`, `ssh_add_exit_code`, and `ssh_add_output` so the agent can tell
 you which requested paths may need checking before reconnecting.
 
-**The pane gets noisy with base64 blobs.** Yes — that's the cost of routing
-file writes through the visible terminal. The skill prefixes blobs with a
-`# remote-ssh-mcp: writing N bytes to <path>` comment so it's at least
-labelled.
+**How are writes verified?** The pane shows concise start and completion
+messages, while the payload is streamed to a no-echo receiver. The receiver
+checks the decoded byte count and SHA-256 before atomically replacing the
+destination. Successful tool responses stay concise and do not include the
+checksum. If verification or recovery fails, the error includes the failed
+stage, whether the destination is known to be unchanged, and whether the pane
+recovered for subsequent commands.
 
 **Subagents seem to share my window.** The skill instructs subagents to call
 `remote_connect` themselves at task start. If they don't, they fall through

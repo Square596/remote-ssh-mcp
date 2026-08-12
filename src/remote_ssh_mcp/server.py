@@ -140,7 +140,7 @@ async def remote_read(
                 conn.pane_id, path, offset=offset, limit=limit
             )
         except FileOpError as e:
-            return _err(str(e))
+            return _err(str(e), **e.details)
 
     text = data.decode("utf-8", errors="replace")
     return _ok(content=text, byte_size=len(data), total_size=total, offset=offset)
@@ -148,7 +148,7 @@ async def remote_read(
 
 @mcp.tool()
 async def remote_write(connection_id: str, path: str, content: str) -> dict:
-    """Atomically write UTF-8 text to a remote path, creating parents."""
+    """Verify and atomically write UTF-8 text, creating parent directories."""
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
@@ -158,7 +158,7 @@ async def remote_write(connection_id: str, path: str, content: str) -> dict:
         try:
             n = await write_remote_file(conn.pane_id, path, content.encode("utf-8"))
         except FileOpError as e:
-            return _err(str(e))
+            return _err(str(e), **e.details)
 
     return _ok(path=path, bytes_written=n)
 
@@ -184,7 +184,7 @@ async def remote_edit(
                 conn.pane_id, path, old=old, new=new, replace_all=replace_all
             )
         except FileOpError as e:
-            return _err(str(e))
+            return _err(str(e), **e.details)
 
     return _ok(
         path=res.path,
