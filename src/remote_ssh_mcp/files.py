@@ -19,7 +19,8 @@ import zlib
 from dataclasses import dataclass
 from typing import Any
 
-from .runner import _tmux, capture_pane, paste_bytes, paste_text, run_in_pane
+from .runner import run_in_pane
+from .tmux import capture_pane, paste_bytes, paste_text, send_keys
 
 MAX_READ_BYTES = 1_048_576  # 1 MB
 WRITE_RAW_CHUNK_BYTES = 49_152  # Exactly 65,536 base64 bytes per full chunk.
@@ -464,13 +465,7 @@ async def _recover_pane(pane_id: str, *, interrupt: bool) -> bool:
     if interrupt:
         for _ in range(2):
             try:
-                await _tmux(
-                    "send-keys",
-                    "-t",
-                    pane_id,
-                    "C-c",
-                    timeout=WRITE_RECOVERY_TIMEOUT,
-                )
+                await send_keys(pane_id, "C-c", timeout=WRITE_RECOVERY_TIMEOUT)
             except RuntimeError:
                 return False
             await asyncio.sleep(0.15)

@@ -14,11 +14,12 @@ from .files import (
     read_remote_file,
     write_remote_file,
 )
-from .runner import run_in_pane
 from .session import SessionError, SessionManager
 
 mcp = MCPServer("remote-ssh-mcp")
 sessions = SessionManager()
+MAX_RUN_OUTPUT_BYTES = 1_048_576
+_TRUNCATION_MARKER = "\n... remote output truncated ...\n"
 
 
 def _err(message: str, **extra) -> dict:
@@ -27,6 +28,20 @@ def _err(message: str, **extra) -> dict:
 
 def _ok(**fields) -> dict:
     return {"ok": True, **fields}
+
+
+def _truncate_output(text: str, limit: int = MAX_RUN_OUTPUT_BYTES) -> tuple[str, bool]:
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text, False
+
+    marker = _TRUNCATION_MARKER.encode("utf-8")
+    available = max(0, limit - len(marker))
+    head_size = available // 2
+    tail_size = available - head_size
+    head = raw[:head_size].decode("utf-8", errors="ignore")
+    tail = raw[-tail_size:].decode("utf-8", errors="ignore") if tail_size else ""
+    return head + _TRUNCATION_MARKER + tail, True
 
 
 @mcp.tool()
@@ -72,7 +87,10 @@ async def remote_connect(
 @mcp.tool()
 async def remote_disconnect(connection_id: str) -> dict:
     """Close this connection's tmux window."""
-    info = await sessions.disconnect(connection_id)
+    try:
+        info = await sessions.disconnect(connection_id)
+    except SessionError as e:
+        return _err(str(e))
     return _ok(**info)
 
 
@@ -90,24 +108,31 @@ async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
         return _err("remote_run rejects empty commands.")
     if "\x00" in cmd:
         return _err("remote_run rejects commands containing NUL characters.")
+    if timeout <= 0:
+        return _err("timeout must be > 0")
 
     try:
         conn = sessions.get(connection_id)
     except SessionError as e:
         return _err(str(e))
 
-    async with conn.lock:
-        try:
-            result = await run_in_pane(conn.pane_id, cmd, timeout=float(timeout))
-        except ValueError as e:
-            return _err(str(e))
+    try:
+        result = await sessions.run_command(conn, cmd, timeout=float(timeout))
+    except (SessionError, ValueError) as e:
+        return _err(str(e))
 
-    return _ok(
-        stdout=result.stdout,
+    stdout, truncated = _truncate_output(result.stdout)
+
+    response = _ok(
+        stdout=stdout,
         exit_code=result.exit_code,
         duration_ms=result.duration_ms,
         timed_out=result.timed_out,
+        truncated=truncated,
     )
+    if result.pane_recovered is not None:
+        response["pane_recovered"] = result.pane_recovered
+    return response
 
 
 @mcp.tool()
@@ -123,7 +148,7 @@ async def remote_read(
     except SessionError as e:
         return _err(str(e))
 
-    async with conn.lock:
+    async with sessions.operation(conn, "read"):
         try:
             data, total = await read_remote_file(
                 conn.pane_id, path, offset=offset, limit=limit
@@ -143,7 +168,7 @@ async def remote_write(connection_id: str, path: str, content: str) -> dict:
     except SessionError as e:
         return _err(str(e))
 
-    async with conn.lock:
+    async with sessions.operation(conn, "write"):
         try:
             n = await write_remote_file(conn.pane_id, path, content.encode("utf-8"))
         except FileOpError as e:
@@ -167,7 +192,7 @@ async def remote_edit(
     except SessionError as e:
         return _err(str(e))
 
-    async with conn.lock:
+    async with sessions.operation(conn, "edit"):
         try:
             res = await edit_remote_file(
                 conn.pane_id, path, old=old, new=new, replace_all=replace_all
@@ -219,11 +244,19 @@ async def remote_grep(
         f"fi"
     )
 
-    async with conn.lock:
-        result = await run_in_pane(conn.pane_id, cmd, timeout=120)
+    try:
+        result = await sessions.run_command(
+            conn, cmd, timeout=120, operation_name="grep"
+        )
+    except SessionError as e:
+        return _err(str(e))
 
     if result.timed_out:
-        return _err("grep timed out", partial_stdout=result.stdout)
+        return _err(
+            "grep timed out",
+            partial_stdout=result.stdout,
+            pane_recovered=result.pane_recovered,
+        )
 
     matches = [line for line in result.stdout.splitlines() if line.strip()]
     return _ok(
@@ -249,11 +282,19 @@ async def remote_glob(
         f"2>/dev/null | head -n {max_results}"
     )
 
-    async with conn.lock:
-        result = await run_in_pane(conn.pane_id, cmd, timeout=60)
+    try:
+        result = await sessions.run_command(
+            conn, cmd, timeout=60, operation_name="glob"
+        )
+    except SessionError as e:
+        return _err(str(e))
 
     if result.timed_out:
-        return _err("glob timed out", partial_stdout=result.stdout)
+        return _err(
+            "glob timed out",
+            partial_stdout=result.stdout,
+            pane_recovered=result.pane_recovered,
+        )
 
     files = [line for line in result.stdout.splitlines() if line.strip()]
     return _ok(files=files, count=len(files), truncated=len(files) >= max_results)

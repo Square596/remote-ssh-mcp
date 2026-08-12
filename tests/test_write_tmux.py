@@ -14,6 +14,7 @@ import pytest
 from remote_ssh_mcp import files
 from remote_ssh_mcp.files import FileOpError, write_remote_file
 from remote_ssh_mcp.runner import capture_pane, run_in_pane
+from remote_ssh_mcp.session import Connection, SessionManager
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RSM_RUN_TMUX_TESTS") != "1",
@@ -90,6 +91,7 @@ async def test_multiline_run_supports_heredocs_and_preserves_state(tmux_pane, tm
     failure = await run_in_pane(
         pane_id, "printf 'before-failure\\n'\nfalse\n", timeout=10
     )
+    no_newline = await run_in_pane(pane_id, "printf no-trailing-newline", timeout=10)
 
     assert result.exit_code == 0, (shell, result.stdout)
     assert result.stdout.splitlines() == [
@@ -101,6 +103,30 @@ async def test_multiline_run_supports_heredocs_and_preserves_state(tmux_pane, tm
     assert state.stdout == f"STATE:{tmp_path}:kept"
     assert failure.exit_code == 1, (shell, failure.stdout)
     assert failure.stdout == "before-failure"
+    assert no_newline.exit_code == 0, (shell, no_newline.stdout)
+    assert no_newline.stdout == "no-trailing-newline"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_run_recovers_shell(tmux_pane):
+    shell, pane_id = tmux_pane
+    conn = Connection(
+        connection_id="test",
+        host="local-test",
+        session_name="test",
+        window_id="@test",
+        pane_id=pane_id,
+        project_path=None,
+        label="test",
+    )
+
+    result = await SessionManager().run_command(conn, "sleep 30", timeout=0.2)
+    probe = await run_in_pane(pane_id, "printf recovered", timeout=5)
+
+    assert result.timed_out is True, (shell, result.stdout)
+    assert result.pane_recovered is True, (shell, result.stdout)
+    assert conn.state == "ready"
+    assert probe.stdout == "recovered"
 
 
 @pytest.mark.asyncio

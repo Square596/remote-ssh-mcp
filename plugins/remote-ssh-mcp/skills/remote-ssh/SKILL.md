@@ -61,5 +61,6 @@ directory, use the `remote-agent-config-sync` skill.
 ## Finish
 
 When the session ends, or when the user says the remote work is done, call
-`remote_disconnect(connection_id)`. If `remote_run` times out, the command may
-still be running; rerun with a longer timeout only when that is clearly safe.
+`remote_disconnect(connection_id)`. If `remote_run` times out, check
+`pane_recovered`: continue only when it is true. If recovery failed, disconnect
+and create a fresh connection. Rerun with a longer timeout only when safe.

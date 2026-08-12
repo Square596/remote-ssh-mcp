@@ -138,39 +138,45 @@ def test_wrap_command_rejects_nul_character() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paste_text_uses_bracketed_paste_and_enter(monkeypatch) -> None:
-    calls: list[tuple[tuple[str, ...], bytes | None, float | None]] = []
+async def test_run_rejects_non_positive_deadlines_before_paste(monkeypatch) -> None:
+    async def unexpected_paste(*args, **kwargs):
+        raise AssertionError("paste should not run")
 
-    async def fake_tmux(*args, stdin=None, timeout=None):
-        calls.append((args, stdin, timeout))
-        return 0, b"", b""
+    monkeypatch.setattr(runner, "paste_text", unexpected_paste)
 
-    monkeypatch.setattr(runner, "_tmux", fake_tmux)
-
-    await runner.paste_text("%1", "echo hello")
-
-    assert calls[0][0][0:2] == ("load-buffer", "-b")
-    assert calls[0][0][3:] == ("-",)
-    assert calls[0][1] == b"echo hello"
-    assert calls[1][0][0:3] == ("paste-buffer", "-r", "-p")
-    assert calls[1][0][-2:] == ("-t", "%1")
-    assert calls[2][0] == ("send-keys", "-t", "%1", "Enter")
+    with pytest.raises(ValueError, match="timeout must be > 0"):
+        await runner.run_in_pane("%1", "true", timeout=0)
+    with pytest.raises(ValueError, match="poll interval must be > 0"):
+        await runner.run_in_pane("%1", "true", poll_interval=0)
 
 
 @pytest.mark.asyncio
-async def test_paste_bytes_is_raw_and_does_not_press_enter(monkeypatch) -> None:
-    calls: list[tuple[tuple[str, ...], bytes | None, float | None]] = []
+async def test_run_polls_recent_lines_then_captures_full_output(monkeypatch) -> None:
+    markers = iter(("left", "right"))
+    captures: list[int] = []
+    poll = "__RSM_END_leftright_0__\n__RSM_CWD_leftright__ /tmp\n"
+    final = (
+        "__RSM_BEGIN_leftright__\n"
+        "output without a user newline\n"
+        "__RSM_END_leftright_0__\n"
+        "__RSM_CWD_leftright__ /tmp\n"
+    )
 
-    async def fake_tmux(*args, stdin=None, timeout=None):
-        calls.append((args, stdin, timeout))
-        return 0, b"", b""
+    async def fake_paste_text(target, text):
+        assert target == "%1"
 
-    monkeypatch.setattr(runner, "_tmux", fake_tmux)
+    async def fake_capture_pane(target, lines):
+        assert target == "%1"
+        captures.append(lines)
+        return poll if len(captures) == 1 else final
 
-    await runner.paste_bytes("%2", b"payload")
+    monkeypatch.setattr(runner.secrets, "token_hex", lambda _: next(markers))
+    monkeypatch.setattr(runner, "paste_text", fake_paste_text)
+    monkeypatch.setattr(runner, "capture_pane", fake_capture_pane)
 
-    assert len(calls) == 2
-    assert calls[0][1] == b"payload"
-    assert calls[1][0][0:2] == ("paste-buffer", "-r")
-    assert "-p" not in calls[1][0]
-    assert calls[1][0][-2:] == ("-t", "%2")
+    result = await runner.run_in_pane("%1", "printf output", timeout=1)
+
+    assert captures == [runner.RUN_POLL_CAPTURE_LINES, runner.RUN_FINAL_CAPTURE_LINES]
+    assert result.stdout == "output without a user newline"
+    assert result.exit_code == 0
+    assert result.cwd == "/tmp"

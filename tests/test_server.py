@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +12,13 @@ from remote_ssh_mcp.files import EditResult, FileOpError
 
 def tool_fn(tool):
     return getattr(tool, "fn", tool)
+
+
+class OperationSessions:
+    @asynccontextmanager
+    async def operation(self, conn, name):
+        async with conn.lock:
+            yield conn
 
 
 @pytest.mark.asyncio
@@ -58,17 +66,17 @@ async def test_remote_run_accepts_multiline_command(monkeypatch) -> None:
             assert connection_id == "conn"
             return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
 
-    async def fake_run_in_pane(pane_id, cmd, timeout=60):
-        captured.update(pane_id=pane_id, cmd=cmd, timeout=timeout)
-        return SimpleNamespace(
-            stdout="a\nb",
-            exit_code=0,
-            duration_ms=12,
-            timed_out=False,
-        )
+        async def run_command(self, conn, cmd, timeout):
+            captured.update(pane_id=conn.pane_id, cmd=cmd, timeout=timeout)
+            return SimpleNamespace(
+                stdout="a\nb",
+                exit_code=0,
+                duration_ms=12,
+                timed_out=False,
+                pane_recovered=None,
+            )
 
     monkeypatch.setattr(server, "sessions", FakeSessions())
-    monkeypatch.setattr(server, "run_in_pane", fake_run_in_pane)
 
     result = await tool_fn(server.remote_run)(
         connection_id="conn", cmd=command, timeout=15
@@ -81,6 +89,7 @@ async def test_remote_run_accepts_multiline_command(monkeypatch) -> None:
         "exit_code": 0,
         "duration_ms": 12,
         "timed_out": False,
+        "truncated": False,
     }
 
 
@@ -93,16 +102,17 @@ async def test_remote_grep_caps_rg_output_with_head(monkeypatch) -> None:
             assert connection_id == "conn"
             return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
 
-    async def fake_run_in_pane(pane_id, cmd, timeout=60):
-        assert pane_id == "%1"
-        captured["cmd"] = cmd
-        return SimpleNamespace(
-            stdout="a\nb\nc\n",
-            timed_out=False,
-        )
+        async def run_command(self, conn, cmd, timeout, operation_name):
+            assert conn.pane_id == "%1"
+            assert timeout == 120
+            assert operation_name == "grep"
+            captured["cmd"] = cmd
+            return SimpleNamespace(
+                stdout="a\nb\nc\n",
+                timed_out=False,
+            )
 
     monkeypatch.setattr(server, "sessions", FakeSessions())
-    monkeypatch.setattr(server, "run_in_pane", fake_run_in_pane)
 
     result = await tool_fn(server.remote_grep)(
         connection_id="conn",
@@ -118,9 +128,28 @@ async def test_remote_grep_caps_rg_output_with_head(monkeypatch) -> None:
     assert " -m 3 " not in captured["cmd"]
 
 
+def test_run_output_truncation_is_utf8_safe_and_exactly_bounded() -> None:
+    text = "start:" + ("✨" * 100) + ":end"
+
+    result, truncated = server._truncate_output(text, limit=80)
+
+    assert truncated is True
+    assert len(result.encode("utf-8")) <= 80
+    assert result.startswith("start:")
+    assert result.endswith(":end")
+    assert "remote output truncated" in result
+
+
+def test_run_output_below_limit_is_unchanged() -> None:
+    result, truncated = server._truncate_output("unchanged", limit=20)
+
+    assert result == "unchanged"
+    assert truncated is False
+
+
 @pytest.mark.asyncio
 async def test_remote_grep_rejects_non_positive_max_results(monkeypatch) -> None:
-    class FakeSessions:
+    class FakeSessions(OperationSessions):
         def get(self, connection_id):
             return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
 
@@ -138,7 +167,7 @@ async def test_remote_grep_rejects_non_positive_max_results(monkeypatch) -> None
 
 @pytest.mark.asyncio
 async def test_remote_write_success_response_stays_stable(monkeypatch) -> None:
-    class FakeSessions:
+    class FakeSessions(OperationSessions):
         def get(self, connection_id):
             assert connection_id == "conn"
             return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
@@ -159,7 +188,7 @@ async def test_remote_write_success_response_stays_stable(monkeypatch) -> None:
 
 @pytest.mark.asyncio
 async def test_remote_write_exposes_diagnostics_only_on_failure(monkeypatch) -> None:
-    class FakeSessions:
+    class FakeSessions(OperationSessions):
         def get(self, connection_id):
             return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
 
@@ -195,7 +224,7 @@ async def test_remote_write_exposes_diagnostics_only_on_failure(monkeypatch) -> 
 
 @pytest.mark.asyncio
 async def test_remote_edit_success_response_stays_stable(monkeypatch) -> None:
-    class FakeSessions:
+    class FakeSessions(OperationSessions):
         def get(self, connection_id):
             return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
 

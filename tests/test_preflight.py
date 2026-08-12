@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import uuid
 from types import SimpleNamespace
@@ -21,12 +22,32 @@ class FakeProc:
         return self._stdout, self._stderr
 
 
+class HangingProc:
+    returncode = None
+
+    def __init__(self) -> None:
+        self.killed = False
+        self.waited = False
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        await asyncio.Future()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def wait(self) -> int:
+        self.waited = True
+        return self.returncode
+
+
 def install_process_mock(
     monkeypatch: pytest.MonkeyPatch, results: list[FakeProc]
 ) -> list[tuple[str, ...]]:
     calls: list[tuple[str, ...]] = []
 
     async def fake_create_subprocess_exec(*args, **kwargs):
+        assert kwargs["stdin"] is subprocess.DEVNULL
         assert kwargs["stdout"] is subprocess.PIPE
         assert kwargs["stderr"] is subprocess.PIPE
         calls.append(tuple(args))
@@ -68,6 +89,8 @@ async def test_preflight_allows_identityfile_auth_without_agent(monkeypatch, ssh
         "-A",
         "-o",
         "BatchMode=yes",
+        "-o",
+        "NumberOfPasswordPrompts=0",
         "-o",
         "ConnectTimeout=10",
         ssh_host,
@@ -180,11 +203,44 @@ async def test_preflight_can_disable_agent_forwarding(monkeypatch, ssh_host):
             "-o",
             "BatchMode=yes",
             "-o",
+            "NumberOfPasswordPrompts=0",
+            "-o",
             "ConnectTimeout=10",
             ssh_host,
             "true",
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_local_ssh_timeout_kills_and_reaps_subprocess() -> None:
+    proc = HangingProc()
+
+    with pytest.raises(SessionError, match="timed out"):
+        await SessionManager()._communicate_process(
+            proc, timeout=0.001, description="test process"
+        )
+
+    assert proc.killed is True
+    assert proc.waited is True
+
+
+@pytest.mark.asyncio
+async def test_local_ssh_cancellation_kills_and_reaps_subprocess() -> None:
+    proc = HangingProc()
+    task = asyncio.create_task(
+        SessionManager()._communicate_process(
+            proc, timeout=30, description="test process"
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert proc.killed is True
+    assert proc.waited is True
 
 
 @pytest.mark.asyncio
@@ -230,7 +286,9 @@ async def test_connect_omits_agent_forwarding_from_session_command(
     conn = await sm.connect(ssh_host, agent_forwarding=False)
 
     assert session_cmds == [
-        f"ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 {ssh_host}"
+        "ssh -o BatchMode=yes -o NumberOfPasswordPrompts=0 "
+        "-o ServerAliveInterval=30 -o ServerAliveCountMax=3 "
+        f"-o EscapeChar=none {ssh_host}"
     ]
     assert conn.agent_warning == "warn"
     assert conn.agent_forwarding is False
