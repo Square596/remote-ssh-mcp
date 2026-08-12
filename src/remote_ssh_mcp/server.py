@@ -168,7 +168,20 @@ async def remote_read(
     except SessionError as e:
         return _err(str(e))
 
-    text = data.decode("utf-8", errors="replace")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
+        return _ok(
+            content=text,
+            byte_size=len(data),
+            total_size=total,
+            offset=offset,
+            encoding_warning=(
+                "This chunk contained invalid UTF-8 bytes; content includes "
+                "replacement characters. The file was not modified."
+            ),
+        )
     return _ok(content=text, byte_size=len(data), total_size=total, offset=offset)
 
 

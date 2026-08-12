@@ -17,10 +17,11 @@ import secrets
 import shlex
 import zlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from .runner import run_in_pane
-from .tmux import capture_pane, paste_bytes, paste_text, send_keys
+from .runner import recover_pane, run_in_pane
+from .tmux import capture_pane, paste_bytes, paste_text
 
 MAX_READ_BYTES = 1_048_576  # 1 MB
 WRITE_RAW_CHUNK_BYTES = 49_152  # Exactly 65,536 base64 bytes per full chunk.
@@ -40,219 +41,10 @@ class FileOpError(Exception):
         }
 
 
-_WRITE_RECEIVER_SOURCE = r"""
-import base64
-import copy
-import hashlib
-import json
-import os
-import shutil
-import sys
-import tempfile
-import termios
-
-path = base64.b64decode(sys.argv[1]).decode("utf-8")
-expected_encoded = int(sys.argv[2])
-expected_bytes = int(sys.argv[3])
-expected_sha256 = sys.argv[4]
-token = sys.argv[5]
-delimiter = (".__RSM_WRITE_PAYLOAD_END_" + token + "__.").encode()
-encoded_path = None
-decoded_path = None
-destination_tmp = None
-actual_bytes = None
-actual_sha256 = None
-committed = False
-replace_started = False
-
-
-def emit(kind, payload):
-    raw = json.dumps(payload, separators=(",", ":")).encode()
-    packed = base64.urlsafe_b64encode(raw).decode()
-    print("\n__RSM_WRITE_" + kind + "_" + token + "__ " + packed, flush=True)
-
-
-def remove(pathname):
-    if pathname is not None:
-        try:
-            os.unlink(pathname)
-        except OSError:
-            pass
-
-
-def fail(stage, exc, destination_state="unchanged"):
-    payload = {
-        "message": str(exc),
-        "stage": stage,
-        "destination_state": destination_state,
-        "expected_bytes": expected_bytes,
-    }
-    if actual_bytes is not None:
-        payload["actual_bytes"] = actual_bytes
-    if stage == "verify":
-        payload["expected_sha256"] = expected_sha256
-    if actual_sha256 is not None:
-        payload["actual_sha256"] = actual_sha256
-    emit("ERROR", payload)
-    return 1
-
-
-def receive_payload():
-    global encoded_path
-    fd = sys.stdin.fileno()
-    old_tty = termios.tcgetattr(fd)
-    new_tty = copy.deepcopy(old_tty)
-    new_tty[3] &= ~(termios.ECHO | termios.ICANON)
-    new_tty[6][termios.VMIN] = 1
-    new_tty[6][termios.VTIME] = 0
-    encoded_fd, encoded_path = tempfile.mkstemp(
-        prefix=".rsm-write-", suffix=".b64"
-    )
-    encoded_file = os.fdopen(encoded_fd, "wb")
-    pending = bytearray()
-    received = 0
-    failure = None
-    try:
-        termios.tcsetattr(fd, termios.TCSANOW, new_tty)
-        emit("READY", {})
-        while True:
-            part = os.read(fd, 65_536)
-            if not part:
-                raise EOFError("terminal input ended during transfer")
-            pending.extend(part)
-            delimiter_at = pending.find(delimiter)
-            if delimiter_at >= 0:
-                encoded_file.write(pending[:delimiter_at])
-                received += delimiter_at
-                trailing = pending[delimiter_at + len(delimiter) :]
-                if trailing:
-                    raise ValueError("unexpected bytes followed the payload delimiter")
-                break
-
-            flush_bytes = len(pending) - len(delimiter) + 1
-            if flush_bytes > 0:
-                encoded_file.write(pending[:flush_bytes])
-                received += flush_bytes
-                del pending[:flush_bytes]
-            if received + len(pending) > expected_encoded + 65_536:
-                raise ValueError("payload exceeded its expected encoded length")
-    except BaseException as exc:
-        failure = exc
-    finally:
-        encoded_file.close()
-        try:
-            termios.tcflush(fd, termios.TCIFLUSH)
-        except termios.error:
-            pass
-        termios.tcsetattr(fd, termios.TCSANOW, old_tty)
-
-    if failure is not None:
-        raise failure
-    if received != expected_encoded:
-        raise ValueError(
-            "encoded length mismatch: expected "
-            + str(expected_encoded)
-            + ", received "
-            + str(received)
-        )
-
-
-def verify_payload():
-    global actual_bytes, actual_sha256, decoded_path
-    decoded_fd, decoded_path = tempfile.mkstemp(
-        prefix=".rsm-write-", suffix=".data"
-    )
-    digest = hashlib.sha256()
-    actual_bytes = 0
-    carry = b""
-    with open(encoded_path, "rb") as source, os.fdopen(decoded_fd, "wb") as target:
-        while True:
-            part = source.read(65_536)
-            if not part:
-                break
-            block = carry + part
-            usable = len(block) - (len(block) % 4)
-            if usable:
-                decoded = base64.b64decode(block[:usable], validate=True)
-                target.write(decoded)
-                digest.update(decoded)
-                actual_bytes += len(decoded)
-            carry = block[usable:]
-        if carry:
-            raise ValueError("encoded payload length is not divisible by four")
-        target.flush()
-        os.fsync(target.fileno())
-
-    actual_sha256 = digest.hexdigest()
-    if actual_bytes != expected_bytes:
-        raise ValueError(
-            "decoded length mismatch: expected "
-            + str(expected_bytes)
-            + ", received "
-            + str(actual_bytes)
-        )
-    if actual_sha256 != expected_sha256:
-        raise ValueError("sha256 mismatch")
-
-
-def commit_payload():
-    global committed, destination_tmp, replace_started
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    os.makedirs(directory, exist_ok=True)
-    mode = (os.stat(path).st_mode & 0o7777) if os.path.exists(path) else None
-    destination_fd, destination_tmp = tempfile.mkstemp(
-        dir=directory, prefix=".rsm-tmp-"
-    )
-    try:
-        if mode is not None:
-            os.fchmod(destination_fd, mode)
-        with open(decoded_path, "rb") as source, os.fdopen(
-            destination_fd, "wb"
-        ) as target:
-            shutil.copyfileobj(source, target, length=1_048_576)
-            target.flush()
-            os.fsync(target.fileno())
-        replace_started = True
-        os.replace(destination_tmp, path)
-        destination_tmp = None
-        committed = True
-    finally:
-        remove(destination_tmp)
-
-
-def main():
-    try:
-        receive_payload()
-    except BaseException as exc:
-        remove(encoded_path)
-        return fail("transfer", exc)
-
-    try:
-        verify_payload()
-    except BaseException as exc:
-        remove(encoded_path)
-        remove(decoded_path)
-        return fail("verify", exc)
-
-    try:
-        commit_payload()
-    except BaseException as exc:
-        remove(encoded_path)
-        remove(decoded_path)
-        state = "unknown" if replace_started or committed else "unchanged"
-        return fail("commit", exc, state)
-
-    remove(encoded_path)
-    remove(decoded_path)
-    emit("DONE", {"bytes_written": actual_bytes, "sha256": actual_sha256})
-    return 0
-
-
-raise SystemExit(main())
-"""
+_WRITE_RECEIVER_BYTES = Path(__file__).with_name("_write_receiver.py").read_bytes()
 
 _WRITE_RECEIVER_PACKED = base64.b64encode(
-    zlib.compress(_WRITE_RECEIVER_SOURCE.encode("utf-8"), level=9)
+    zlib.compress(_WRITE_RECEIVER_BYTES, level=9)
 ).decode("ascii")
 
 
@@ -461,26 +253,6 @@ async def _wait_for_receiver(
     )
 
 
-async def _recover_pane(pane_id: str, *, interrupt: bool) -> bool:
-    if interrupt:
-        for _ in range(2):
-            try:
-                await send_keys(pane_id, "C-c", timeout=WRITE_RECOVERY_TIMEOUT)
-            except RuntimeError:
-                return False
-            await asyncio.sleep(0.15)
-
-    try:
-        result = await run_in_pane(
-            pane_id,
-            "stty sane >/dev/null 2>&1 || true",
-            timeout=WRITE_RECOVERY_TIMEOUT,
-        )
-    except (RuntimeError, ValueError):
-        return False
-    return not result.timed_out and result.exit_code == 0
-
-
 async def _settle_receiver(pane_id: str, token: str) -> bool:
     try:
         await _wait_for_receiver(
@@ -490,8 +262,8 @@ async def _settle_receiver(pane_id: str, token: str) -> bool:
             WRITE_RECOVERY_TIMEOUT,
         )
     except (RuntimeError, TimeoutError, ValueError):
-        return await _recover_pane(pane_id, interrupt=True)
-    return await _recover_pane(pane_id, interrupt=False)
+        pass
+    return await recover_pane(pane_id, timeout=WRITE_RECOVERY_TIMEOUT)
 
 
 async def _probe_destination(
@@ -656,12 +428,12 @@ async def write_remote_file(pane_id: str, path: str, content: bytes) -> int:
             )
         return content_bytes
     except asyncio.CancelledError:
-        await asyncio.shield(_recover_pane(pane_id, interrupt=True))
+        await asyncio.shield(recover_pane(pane_id, timeout=WRITE_RECOVERY_TIMEOUT))
         raise
     except FileOpError:
         raise
     except Exception as exc:
-        pane_recovered = await _recover_pane(pane_id, interrupt=True)
+        pane_recovered = await recover_pane(pane_id, timeout=WRITE_RECOVERY_TIMEOUT)
         probe = _DestinationProbe(available=False, matches=False)
         if pane_recovered:
             probe = await _probe_destination(
@@ -714,7 +486,7 @@ async def edit_remote_file(
     except UnicodeDecodeError as e:
         raise FileOpError(
             f"remote_edit only handles UTF-8 text files; {path} is not valid UTF-8 ({e}). "
-            f"Use remote_write with the full new content for binary files."
+            "Use scp/rsync or a binary-safe remote_run command for binary files."
         )
 
     count = text.count(old)

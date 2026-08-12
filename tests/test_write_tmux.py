@@ -265,6 +265,27 @@ async def test_large_writes_roundtrip_without_echoing_payload(tmux_pane, tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_write_obeys_umask_and_preserves_symlink(tmux_pane, tmp_path):
+    _, pane_id = tmux_pane
+    new_file = tmp_path / "nested" / "created.txt"
+    target = tmp_path / "target.txt"
+    target.write_bytes(b"old")
+    target.chmod(0o604)
+    link = tmp_path / "link.txt"
+    link.symlink_to(target.name)
+
+    umask_result = await run_in_pane(pane_id, "umask 027", timeout=5)
+    assert umask_result.exit_code == 0
+    await write_remote_file(pane_id, str(new_file), b"created")
+    await write_remote_file(pane_id, str(link), b"replacement")
+
+    assert stat.S_IMODE(new_file.stat().st_mode) == 0o640
+    assert link.is_symlink()
+    assert target.read_bytes() == b"replacement"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o604
+
+
+@pytest.mark.asyncio
 async def test_corrupt_payload_is_rejected_before_replace(
     tmux_pane, tmp_path, monkeypatch
 ):

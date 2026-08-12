@@ -40,7 +40,9 @@ paste it verbatim, and ask for the correct project path before doing work.
 
 `remote_run` accepts single- or multi-line shell commands, including heredocs,
 and keeps cwd/env state. `remote_edit` accepts multi-line exact strings; make
-`old` unique or use `replace_all=true`.
+`old` unique or use `replace_all=true`. File APIs are UTF-8 text-oriented; if
+`remote_read` returns `encoding_warning`, use a binary-safe command or transfer
+tool instead of editing the replacement-character text.
 
 Local shell tools are only for local-side work, such as `scp`/`rsync` config
 transfer. Do not use local filesystem or shell tools to inspect or edit the

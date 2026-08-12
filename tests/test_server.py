@@ -202,6 +202,70 @@ async def test_invalid_edit_does_not_start_recovering_operation(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_remote_read_only_warns_for_invalid_utf8(monkeypatch) -> None:
+    class FakeSessions(OperationSessions):
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+    reads = [b"plain text", b"invalid:\xff"]
+
+    async def fake_read(*args, **kwargs):
+        data = reads.pop(0)
+        return data, len(data)
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+    monkeypatch.setattr(server, "read_remote_file", fake_read)
+
+    valid = await tool_fn(server.remote_read)(connection_id="conn", path="file.txt")
+    invalid = await tool_fn(server.remote_read)(connection_id="conn", path="file.txt")
+
+    assert valid == {
+        "ok": True,
+        "content": "plain text",
+        "byte_size": 10,
+        "total_size": 10,
+        "offset": 0,
+    }
+    assert invalid["content"] == "invalid:\ufffd"
+    assert "encoding_warning" in invalid
+
+
+@pytest.mark.asyncio
+async def test_failed_file_recovery_marks_connection_unresponsive(monkeypatch) -> None:
+    from remote_ssh_mcp.session import Connection, SessionManager
+
+    manager = SessionManager()
+    connection = Connection(
+        connection_id="conn",
+        host="host",
+        session_name="session",
+        window_id="@1",
+        pane_id="%1",
+        project_path=None,
+        label="test",
+    )
+    manager._connections[connection.connection_id] = connection
+
+    async def fake_write(*args, **kwargs):
+        raise FileOpError(
+            "pane could not recover",
+            pane_recovered=False,
+            stage="transfer",
+        )
+
+    monkeypatch.setattr(server, "sessions", manager)
+    monkeypatch.setattr(server, "write_remote_file", fake_write)
+
+    result = await tool_fn(server.remote_write)(
+        connection_id="conn", path="file.txt", content="content"
+    )
+
+    assert result["ok"] is False
+    assert result["pane_recovered"] is False
+    assert connection.state == "unresponsive"
+
+
+@pytest.mark.asyncio
 async def test_remote_write_success_response_stays_stable(monkeypatch) -> None:
     class FakeSessions(OperationSessions):
         def get(self, connection_id):
