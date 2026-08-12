@@ -1,18 +1,14 @@
 from __future__ import annotations
 
-import stat
-import subprocess
-from types import SimpleNamespace
-
 import pytest
 
 from remote_ssh_mcp import files
 from remote_ssh_mcp.files import (
     MAX_READ_BYTES,
     FileOpError,
+    _receiver_command,
     edit_remote_file,
     read_remote_file,
-    write_remote_file,
 )
 
 
@@ -26,6 +22,19 @@ async def test_read_remote_file_rejects_invalid_bounds() -> None:
 
     with pytest.raises(FileOpError, match="exceeds max"):
         await read_remote_file("pane", "/remote/file", limit=MAX_READ_BYTES + 1)
+
+
+def test_write_receiver_bootstrap_is_one_shell_line() -> None:
+    command = _receiver_command(
+        "/remote/path with spaces/file.txt",
+        encoded_bytes=8,
+        content_bytes=5,
+        sha256="a" * 64,
+        token="b" * 32,
+    )
+
+    assert "\n" not in command
+    assert "/remote/path with spaces/file.txt" not in command
 
 
 @pytest.mark.asyncio
@@ -60,33 +69,3 @@ async def test_edit_remote_file_reads_all_chunks_before_writing(monkeypatch) -> 
 async def test_edit_remote_file_rejects_empty_old() -> None:
     with pytest.raises(FileOpError, match="old must not be empty"):
         await edit_remote_file("pane", "/remote/file.txt", old="", new="x")
-
-
-@pytest.mark.asyncio
-async def test_write_remote_file_preserves_existing_mode(monkeypatch, tmp_path) -> None:
-    target = tmp_path / "tool.sh"
-    target.write_bytes(b"old")
-    target.chmod(0o755)
-
-    async def fake_run_in_pane(pane_id, cmd, timeout=60):
-        assert pane_id == "pane"
-        proc = subprocess.run(
-            cmd,
-            shell=True,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        return SimpleNamespace(
-            stdout=proc.stdout + proc.stderr,
-            exit_code=proc.returncode,
-            timed_out=False,
-        )
-
-    monkeypatch.setattr(files, "run_in_pane", fake_run_in_pane)
-
-    written = await write_remote_file("pane", str(target), b"new")
-
-    assert written == 3
-    assert target.read_bytes() == b"new"
-    assert stat.S_IMODE(target.stat().st_mode) == 0o755

@@ -45,3 +45,18 @@ jobs:
           python-version: "3.12"
       - run: uv lock --check
       - run: uv run --frozen ruff check .
+
+  terminal-transfer:
+    name: Real tmux writes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+      - name: Install terminal shells
+        run: sudo apt-get update && sudo apt-get install -y tmux zsh
+      - name: Run real tmux transfer tests
+        env:
+          RSM_RUN_TMUX_TESTS: "1"
+        run: uv run --frozen pytest -q tests/test_write_tmux.py
