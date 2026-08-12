@@ -7,6 +7,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import uuid
 
 import pytest
@@ -23,12 +24,14 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(params=("bash", "zsh"))
-def tmux_pane(request):
+def tmux_pane(request, monkeypatch):
     tmux = shutil.which("tmux")
     shell = shutil.which(request.param)
     if tmux is None or shell is None:
         pytest.skip(f"tmux and {request.param} are required")
 
+    socket_root = tempfile.TemporaryDirectory(prefix="rsm-tmux-", dir="/tmp")
+    monkeypatch.setenv("TMUX_TMPDIR", socket_root.name)
     session = f"rsm-write-test-{uuid.uuid4().hex[:10]}"
     shell_args = ["-f"] if request.param == "zsh" else ["--noprofile", "--norc"]
     subprocess.run(
@@ -90,6 +93,7 @@ def tmux_pane(request):
             check=False,
             capture_output=True,
         )
+        socket_root.cleanup()
 
 
 def _payload(size: int) -> bytes:
@@ -98,11 +102,13 @@ def _payload(size: int) -> bytes:
 
 
 @pytest.mark.asyncio
-async def test_session_lookup_is_exact_for_prefix_names() -> None:
+async def test_session_lookup_is_exact_for_prefix_names(monkeypatch) -> None:
     tmux = shutil.which("tmux")
     if tmux is None:
         pytest.skip("tmux is required")
 
+    socket_root = tempfile.TemporaryDirectory(prefix="rsm-tmux-", dir="/tmp")
+    monkeypatch.setenv("TMUX_TMPDIR", socket_root.name)
     stem = f"rsm-prefix-{uuid.uuid4().hex[:10]}"
     names = (stem, f"{stem}-extended")
     try:
@@ -130,6 +136,7 @@ async def test_session_lookup_is_exact_for_prefix_names() -> None:
                 check=False,
                 capture_output=True,
             )
+        socket_root.cleanup()
 
 
 @pytest.mark.asyncio
