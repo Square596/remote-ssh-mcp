@@ -214,8 +214,8 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 | `remote_disconnect(connection_id)` | — | Closes window. Closes session if last window. |
 | `remote_status()` | — | Lists active connections with lifecycle and recent activity details. |
 | `remote_run(connection_id, cmd, timeout?)` | Shell | Persistent shell with multi-line command and heredoc support. Reports timeout, truncation, and pane recovery when applicable. |
-| `remote_read(connection_id, path, offset?, limit?)` | Read | Base64 round-trip through tmux. ≤1 MB. |
-| `remote_write(connection_id, path, content)` | Write | Streams without terminal echo; verifies size and SHA-256 before atomic replace. |
+| `remote_read(connection_id, path, offset?, limit?)` | Read | Returns up to 1 MB of text; flags chunks containing invalid UTF-8. |
+| `remote_write(connection_id, path, content)` | Write | Atomically writes UTF-8 text after transport verification; preserves existing modes and symlinks. |
 | `remote_edit(connection_id, path, old, new, replace_all?)` | Edit | Exact single- or multi-line match; errors if `old` is non-unique unless `replace_all=true`. |
 | `remote_grep(connection_id, pattern, path?, glob?)` | Grep | Uses `rg` if available, else `grep -r`. |
 | `remote_glob(connection_id, pattern, path?)` | Glob | Uses `find`. |
@@ -251,7 +251,9 @@ checks the decoded byte count and SHA-256 before atomically replacing the
 destination. Successful tool responses stay concise and do not include the
 checksum. If verification or recovery fails, the error includes the failed
 stage, whether the destination is known to be unchanged, and whether the pane
-recovered for subsequent commands.
+recovered for subsequent commands. Existing file modes are preserved, new
+files follow the remote shell's umask, and writes through symlinks update their
+targets without replacing the links.
 
 **Subagents seem to share my window.** The skill instructs subagents to call
 `remote_connect` themselves at task start. If they don't, they fall through
@@ -273,8 +275,10 @@ to your window. Check the parent's prompt to subagents.
 - **No interactive TUI driving.** Things that need a TTY (vim, less in
   interactive mode, sudo password prompts) won't work cleanly. Use
   non-interactive equivalents.
-- **Binary file edits via `remote_edit`** treat content as UTF-8 strings.
-  For true binary edits, use `remote_write` with the full new content.
+- **File tools expose text through MCP.** `remote_write` and `remote_edit`
+  encode their string inputs as UTF-8. `remote_read` replaces invalid UTF-8
+  bytes and adds `encoding_warning`. Use `scp`/`rsync` or a binary-safe
+  `remote_run` command when exact binary bytes matter.
 
 ## License
 
