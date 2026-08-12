@@ -7,13 +7,15 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import uuid
 
 import pytest
 
 from remote_ssh_mcp import files
 from remote_ssh_mcp.files import FileOpError, write_remote_file
-from remote_ssh_mcp.runner import capture_pane, run_in_pane
+from remote_ssh_mcp.runner import PANE_HISTORY_LIMIT, capture_pane, run_in_pane
+from remote_ssh_mcp.session import Connection, SessionManager
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("RSM_RUN_TMUX_TESTS") != "1",
@@ -22,15 +24,17 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(params=("bash", "zsh"))
-def tmux_pane(request):
+def tmux_pane(request, monkeypatch):
     tmux = shutil.which("tmux")
     shell = shutil.which(request.param)
     if tmux is None or shell is None:
         pytest.skip(f"tmux and {request.param} are required")
 
+    socket_root = tempfile.TemporaryDirectory(prefix="rsm-tmux-", dir="/tmp")
+    monkeypatch.setenv("TMUX_TMPDIR", socket_root.name)
     session = f"rsm-write-test-{uuid.uuid4().hex[:10]}"
     shell_args = ["-f"] if request.param == "zsh" else ["--noprofile", "--norc"]
-    proc = subprocess.run(
+    subprocess.run(
         [
             tmux,
             "new-session",
@@ -42,6 +46,30 @@ def tmux_pane(request):
             "-y",
             "50",
             "-P",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            tmux,
+            "set-option",
+            "-t",
+            session,
+            "history-limit",
+            str(PANE_HISTORY_LIMIT),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    proc = subprocess.run(
+        [
+            tmux,
+            "new-window",
+            "-d",
+            "-t",
+            f"{session}:",
+            "-P",
             "-F",
             "#{pane_id}",
             shell,
@@ -52,6 +80,11 @@ def tmux_pane(request):
         text=True,
     )
     pane_id = proc.stdout.strip()
+    subprocess.run(
+        [tmux, "kill-window", "-t", f"{session}:0"],
+        check=True,
+        capture_output=True,
+    )
     try:
         yield request.param, pane_id
     finally:
@@ -60,11 +93,50 @@ def tmux_pane(request):
             check=False,
             capture_output=True,
         )
+        socket_root.cleanup()
 
 
 def _payload(size: int) -> bytes:
     seed = b"RSM_PAYLOAD_MUST_NOT_APPEAR_IN_THE_PANE_0123456789\n"
     return (seed * ((size // len(seed)) + 1))[:size]
+
+
+@pytest.mark.asyncio
+async def test_session_lookup_is_exact_for_prefix_names(monkeypatch) -> None:
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        pytest.skip("tmux is required")
+
+    socket_root = tempfile.TemporaryDirectory(prefix="rsm-tmux-", dir="/tmp")
+    monkeypatch.setenv("TMUX_TMPDIR", socket_root.name)
+    stem = f"rsm-prefix-{uuid.uuid4().hex[:10]}"
+    names = (stem, f"{stem}-extended")
+    try:
+        for name in reversed(names):
+            subprocess.run(
+                [tmux, "new-session", "-d", "-s", name],
+                check=True,
+                capture_output=True,
+            )
+
+        target = await SessionManager()._session_target(stem)
+        assert target is not None
+        resolved = subprocess.run(
+            [tmux, "display-message", "-p", "-t", target, "#{session_name}"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert resolved.stdout.strip() == stem
+    finally:
+        for name in names:
+            subprocess.run(
+                [tmux, "kill-session", "-t", name],
+                check=False,
+                capture_output=True,
+            )
+        socket_root.cleanup()
 
 
 @pytest.mark.asyncio
@@ -90,6 +162,7 @@ async def test_multiline_run_supports_heredocs_and_preserves_state(tmux_pane, tm
     failure = await run_in_pane(
         pane_id, "printf 'before-failure\\n'\nfalse\n", timeout=10
     )
+    no_newline = await run_in_pane(pane_id, "printf no-trailing-newline", timeout=10)
 
     assert result.exit_code == 0, (shell, result.stdout)
     assert result.stdout.splitlines() == [
@@ -101,6 +174,73 @@ async def test_multiline_run_supports_heredocs_and_preserves_state(tmux_pane, tm
     assert state.stdout == f"STATE:{tmp_path}:kept"
     assert failure.exit_code == 1, (shell, failure.stdout)
     assert failure.stdout == "before-failure"
+    assert no_newline.exit_code == 0, (shell, no_newline.stdout)
+    assert no_newline.stdout == "no-trailing-newline"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_run_recovers_shell(tmux_pane):
+    shell, pane_id = tmux_pane
+    conn = Connection(
+        connection_id="test",
+        host="local-test",
+        session_name="test",
+        window_id="@test",
+        pane_id=pane_id,
+        project_path=None,
+        label="test",
+    )
+
+    result = await SessionManager().run_command(conn, "sleep 30", timeout=0.2)
+    probe = await run_in_pane(pane_id, "printf recovered", timeout=5)
+
+    assert result.timed_out is True, (shell, result.stdout)
+    assert result.pane_recovered is True, (shell, result.stdout)
+    assert conn.state == "ready"
+    assert probe.stdout == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_run_preserves_framing_beyond_previous_history_limit(tmux_pane):
+    shell, pane_id = tmux_pane
+    command = "python3 -c 'import sys; sys.stdout.write(\"x\\n\" * 100001)'"
+
+    result = await run_in_pane(pane_id, command, timeout=15)
+
+    assert result.exit_code == 0, (shell, result.stdout[-1000:])
+    assert len(result.stdout.splitlines()) == 100001
+
+
+@pytest.mark.asyncio
+async def test_timed_out_file_read_recovers_shell(tmux_pane, tmp_path, monkeypatch):
+    shell, pane_id = tmux_pane
+    fifo = tmp_path / "blocked-read"
+    os.mkfifo(fifo)
+    real_run = files.run_in_pane
+    conn = Connection(
+        connection_id="test",
+        host="local-test",
+        session_name="test",
+        window_id="@test",
+        pane_id=pane_id,
+        project_path=None,
+        label="test",
+    )
+
+    async def capped_run(pane, command, timeout=60):
+        return await real_run(pane, command, timeout=min(timeout, 0.2))
+
+    monkeypatch.setattr(files, "run_in_pane", capped_run)
+    manager = SessionManager()
+
+    with pytest.raises(FileOpError) as exc_info:
+        async with manager.operation(conn, "read", recover_on_failure=True):
+            await files.read_remote_file(pane_id, str(fifo))
+
+    probe = await real_run(pane_id, "printf recovered", timeout=5)
+    assert exc_info.value.details["pane_recovered"] is True, shell
+    assert conn.state == "ready"
+    assert probe.stdout == "recovered"
 
 
 @pytest.mark.asyncio

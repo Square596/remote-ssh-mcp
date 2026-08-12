@@ -7,21 +7,32 @@ import re
 import secrets
 import shlex
 import subprocess
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from os.path import expanduser
-from typing import Optional
+from typing import AsyncIterator, Literal, Optional
 
-from .runner import _tmux, capture_pane, paste_text, run_in_pane
+from .runner import PANE_HISTORY_LIMIT, RunResult, recover_pane, run_in_pane
+from .tmux import TmuxError, capture_pane, kill_window, paste_text, tmux
 
 SESSION_PREFIX = "remote-ssh-mcp"
 HOST_RE = re.compile(r"^[a-zA-Z0-9._-]+$")
 SHELL_READY_CAPTURE_LINES = 100
 SHELL_READY_POLL_INTERVAL = 0.5
 SHELL_READY_RETRY_INTERVAL = 2.0
+LOCAL_SSH_TIMEOUT = 15.0
+LAST_ERROR_LIMIT = 1_000
+
+ConnectionState = Literal["ready", "busy", "unresponsive", "closing"]
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _session_name(host: str) -> str:
-    if not HOST_RE.match(host):
+    if host.startswith("-") or not HOST_RE.fullmatch(host):
         raise SessionError(
             f"Invalid host name {host!r}. Use the alias from your ~/.ssh/config "
             f"(letters, digits, dot, underscore, hyphen only)."
@@ -67,6 +78,10 @@ class Connection:
     ssh_add_exit_code: Optional[int] = None
     ssh_add_output: Optional[str] = None
     forwarded_agent_present: Optional[bool] = None
+    state: ConnectionState = "ready"
+    current_operation: Optional[str] = None
+    last_activity_at: str = field(default_factory=_now)
+    last_error: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -83,44 +98,61 @@ class SessionManager:
         agent_forwarding: bool = True,
         ssh_add_paths: Optional[list[str]] = None,
     ) -> Connection:
-        async with self._connect_lock:
-            session = _session_name(host)
-            label = label or f"agent-{secrets.token_hex(3)}"
+        session = _session_name(host)
+        label = label or f"agent-{secrets.token_hex(3)}"
+        self._validate_text("label", label, allow_newlines=False)
+        if project_path is not None:
+            self._validate_text("project_path", project_path)
+        self._validate_ssh_add_paths(ssh_add_paths)
 
-            preflight = await self._preflight(
+        preflight = await self._preflight(
+            host,
+            agent_forwarding=agent_forwarding,
+            ssh_add_paths=ssh_add_paths,
+        )
+
+        ssh_args = ["ssh"]
+        if agent_forwarding:
+            ssh_args.append("-A")
+        ssh_args.extend(
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "NumberOfPasswordPrompts=0",
+                "-o",
+                "ServerAliveInterval=30",
+                "-o",
+                "ServerAliveCountMax=3",
+                "-o",
+                "EscapeChar=none",
                 host,
-                agent_forwarding=agent_forwarding,
-                ssh_add_paths=ssh_add_paths,
-            )
+            ]
+        )
+        ssh_cmd = " ".join(shlex.quote(arg) for arg in ssh_args)
+        window_id: str | None = None
+        pane_id: str | None = None
+        try:
+            # Only tmux session/window creation needs cross-connection
+            # serialization. Login readiness can proceed independently per pane.
+            async with self._connect_lock:
+                session_target = await self._session_target(session)
+                if session_target is not None:
+                    await self._configure_history(session_target)
+                    window_id, pane_id = await self._new_window(
+                        session_target, label, ssh_cmd
+                    )
+                else:
+                    window_id, pane_id = await self._new_session(
+                        session, label, ssh_cmd
+                    )
 
-            # ServerAliveInterval keeps idle TCP connections from being torn
-            # down by middleboxes or aggressive remote configs — relevant when
-            # multiple subagents connect in parallel and one sits briefly idle
-            # between connect-completion and its first command.
-            agent_flag = "-A " if agent_forwarding else ""
-            ssh_cmd = (
-                f"ssh {agent_flag}"
-                f"-o ServerAliveInterval=30 "
-                f"-o ServerAliveCountMax=3 "
-                f"{shlex.quote(host)}"
-            )
-            if await self._session_exists(session):
-                window_id, pane_id = await self._new_window(session, label, ssh_cmd)
-            else:
-                window_id, pane_id = await self._new_session(session, label, ssh_cmd)
-
-            await self._configure_history(session)
             await self._wait_for_shell(pane_id, host)
 
             cwd_warning: Optional[str] = None
             if project_path:
                 cd_cmd = f"cd {shlex.quote(project_path)}"
                 cd_result = await run_in_pane(pane_id, cd_cmd, timeout=15)
-                # Retry once on timeout — the first paste after a fresh ssh
-                # is sometimes lost (agent-forwarding race, slow login script,
-                # or a transient network blip). A second attempt usually goes
-                # through. If it still times out, surface that cleanly rather
-                # than masquerading as a path-not-found.
                 if cd_result.timed_out:
                     cd_result = await run_in_pane(pane_id, cd_cmd, timeout=15)
                 if cd_result.timed_out:
@@ -144,9 +176,10 @@ class SessionManager:
                         f"wrong until this is fixed."
                     )
 
-            # Always capture the actual cwd so the agent knows where it is.
             pwd_result = await run_in_pane(pane_id, "pwd", timeout=10)
-            cwd = pwd_result.stdout.strip() if pwd_result.exit_code == 0 else "?"
+            cwd = getattr(pwd_result, "cwd", None) or (
+                pwd_result.stdout.strip() if pwd_result.exit_code == 0 else "?"
+            )
 
             conn_id = secrets.token_hex(6)
             conn = Connection(
@@ -168,6 +201,34 @@ class SessionManager:
             )
             self._connections[conn_id] = conn
             return conn
+        except BaseException:
+            if window_id is not None:
+                await asyncio.shield(self._cleanup_window(window_id))
+            raise
+
+    @staticmethod
+    def _validate_text(name: str, value: str, *, allow_newlines: bool = True) -> None:
+        if "\x00" in value:
+            raise SessionError(f"{name} must not contain NUL characters.")
+        if not allow_newlines and any(char in value for char in "\r\n"):
+            raise SessionError(f"{name} must not contain newlines.")
+
+    @classmethod
+    def _validate_ssh_add_paths(cls, paths: Optional[list[str]]) -> None:
+        for path in paths or []:
+            cls._validate_text("ssh_add_paths entry", path, allow_newlines=False)
+            if not path or path.startswith("-"):
+                raise SessionError(
+                    "ssh_add_paths entries must be non-empty file paths and must "
+                    "not start with '-'."
+                )
+
+    @staticmethod
+    async def _cleanup_window(window_id: str) -> None:
+        try:
+            await kill_window(window_id)
+        except (TmuxError, ValueError):
+            pass
 
     async def _preflight(
         self,
@@ -193,13 +254,18 @@ class SessionManager:
             "-o",
             "BatchMode=yes",
             "-o",
+            "NumberOfPasswordPrompts=0",
+            "-o",
             "ConnectTimeout=10",
             host,
             "true",
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        _, err = await proc.communicate()
+        _, err = await self._communicate_process(
+            proc, timeout=LOCAL_SSH_TIMEOUT, description=f"SSH preflight for {host!r}"
+        )
         if proc.returncode != 0:
             stderr = err.decode("utf-8", errors="replace").strip() or "(no stderr)"
             raise SessionError(
@@ -221,14 +287,21 @@ class SessionManager:
             "-o",
             "BatchMode=yes",
             "-o",
+            "NumberOfPasswordPrompts=0",
+            "-o",
             "ConnectTimeout=10",
             host,
             "ssh-add",
             "-l",
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        _, err = await proc.communicate()
+        _, err = await self._communicate_process(
+            proc,
+            timeout=LOCAL_SSH_TIMEOUT,
+            description=f"forwarded-agent check for {host!r}",
+        )
         if proc.returncode == 0:
             result.forwarded_agent_present = True
             result.agent_warning = "\n".join(warnings) if warnings else None
@@ -258,6 +331,26 @@ class SessionManager:
         result.agent_warning = "\n".join(warnings)
         return result
 
+    @staticmethod
+    async def _communicate_process(
+        proc: asyncio.subprocess.Process,
+        *,
+        timeout: float,
+        description: str,
+    ) -> tuple[bytes, bytes]:
+        try:
+            return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (TimeoutError, asyncio.TimeoutError):
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise SessionError(f"{description} timed out after {timeout:g}s.") from None
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
+
     async def _ssh_add(self, ssh_add_paths: Optional[list[str]]) -> SshAddResult:
         paths = [expanduser(path) for path in ssh_add_paths or []]
         explicit_paths = bool(paths)
@@ -272,7 +365,7 @@ class SessionManager:
         )
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=10)
-        except asyncio.TimeoutError:
+        except (TimeoutError, asyncio.TimeoutError):
             proc.kill()
             await proc.wait()
             if paths:
@@ -290,6 +383,11 @@ class SessionManager:
                     "host may fail."
                 )
             return SshAddResult(paths=paths, output=warning, warning=warning)
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                proc.kill()
+            await proc.wait()
+            raise
 
         output = self._process_output(out, err)
 
@@ -331,39 +429,72 @@ class SessionManager:
         ]
         return "\n".join(parts) if parts else None
 
-    async def _session_exists(self, session: str) -> bool:
-        rc, _, _ = await _tmux("has-session", "-t", f"={session}")
-        return rc == 0
+    async def _session_target(self, session: str) -> str | None:
+        """Return the exact tmux session id for a name, never a prefix match."""
+        rc, out, err = await tmux(
+            "list-sessions", "-F", "#{session_id}\t#{session_name}"
+        )
+        if rc != 0:
+            message = err.decode(errors="replace").strip()
+            if any(
+                detail in message
+                for detail in (
+                    "no server running",
+                    "failed to connect to server",
+                    "error connecting to",
+                )
+            ):
+                return None
+            raise SessionError(f"tmux session lookup failed: {message}")
+
+        for line in out.decode(errors="replace").splitlines():
+            session_id, separator, session_name = line.partition("\t")
+            if separator and session_name == session:
+                return session_id
+        return None
 
     async def _new_session(self, session: str, label: str, cmd: str) -> tuple[str, str]:
-        rc, out, err = await _tmux(
+        rc, out, err = await tmux(
             "new-session",
             "-d",
             "-s",
             session,
             "-n",
-            label,
+            "__bootstrap__",
             "-x",
             "220",
             "-y",
             "50",
             "-P",
             "-F",
-            "#{window_id} #{pane_id}",
-            cmd,
+            "#{session_id} #{window_id} #{pane_id}",
         )
         if rc != 0:
             raise SessionError(
                 f"tmux new-session failed: {err.decode(errors='replace')}"
             )
-        window_id, pane_id = out.decode().strip().split()
-        return window_id, pane_id
+        session_target, bootstrap_window, _ = out.decode().strip().split()
+        window_id: str | None = None
+        try:
+            # tmux snapshots history-limit when a pane is created. Establish
+            # the session option before creating the real SSH pane.
+            await self._configure_history(session_target)
+            window_id, pane_id = await self._new_window(session_target, label, cmd)
+            await self._cleanup_window(bootstrap_window)
+            return window_id, pane_id
+        except BaseException:
+            if window_id is not None:
+                await asyncio.shield(self._cleanup_window(window_id))
+            await asyncio.shield(self._cleanup_window(bootstrap_window))
+            raise
 
-    async def _new_window(self, session: str, label: str, cmd: str) -> tuple[str, str]:
-        rc, out, err = await _tmux(
+    async def _new_window(
+        self, session_target: str, label: str, cmd: str
+    ) -> tuple[str, str]:
+        rc, out, err = await tmux(
             "new-window",
             "-t",
-            f"={session}:",
+            f"{session_target}:",
             "-n",
             label,
             "-P",
@@ -443,23 +574,142 @@ class SessionManager:
             f"Last pane:\n{last_screen[-1500:]}"
         )
 
-    async def _configure_history(self, session: str) -> None:
+    async def _configure_history(self, session_target: str) -> None:
         # Bigger history makes large `remote_read` outputs survivable.
-        await _tmux("set-option", "-t", f"={session}", "history-limit", "100000")
+        rc, _, err = await tmux(
+            "set-option",
+            "-t",
+            session_target,
+            "history-limit",
+            str(PANE_HISTORY_LIMIT),
+        )
+        if rc != 0:
+            raise SessionError(
+                f"tmux history configuration failed: {err.decode(errors='replace')}"
+            )
+
+    @asynccontextmanager
+    async def operation(
+        self,
+        conn: Connection,
+        name: str,
+        *,
+        recover_on_failure: bool = False,
+    ) -> AsyncIterator[Connection]:
+        """Serialize one pane operation and publish its lifecycle in status."""
+        async with conn.lock:
+            self._ensure_usable(conn)
+            conn.state = "busy"
+            conn.current_operation = name
+            conn.last_activity_at = _now()
+            conn.last_error = None
+            try:
+                yield conn
+            except asyncio.CancelledError:
+                message = f"{name} was cancelled"
+                if recover_on_failure:
+                    recovered = await asyncio.shield(recover_pane(conn.pane_id))
+                    self._record_recovery(conn, recovered, message)
+                elif conn.last_error is None:
+                    self._record_error(conn, message)
+                raise
+            except Exception as exc:
+                if recover_on_failure:
+                    details = getattr(exc, "details", {})
+                    recovered = details.get("pane_recovered")
+                    if not isinstance(recovered, bool):
+                        recovered = await recover_pane(conn.pane_id)
+                        if isinstance(details, dict):
+                            details["pane_recovered"] = recovered
+                    self._record_recovery(conn, recovered, f"{name} failed: {exc}")
+                else:
+                    self._record_error(conn, str(exc))
+                raise
+            finally:
+                conn.current_operation = None
+                conn.last_activity_at = _now()
+                if conn.state == "busy":
+                    conn.state = "ready"
+
+    async def run_command(
+        self,
+        conn: Connection,
+        command: str,
+        *,
+        timeout: float,
+        operation_name: str = "run",
+    ) -> RunResult:
+        """Run a public command and recover the pane on timeout or cancellation."""
+        async with self.operation(conn, operation_name):
+            try:
+                result = await run_in_pane(conn.pane_id, command, timeout=timeout)
+            except asyncio.CancelledError:
+                recovered = await asyncio.shield(recover_pane(conn.pane_id))
+                self._record_recovery(
+                    conn, recovered, f"{operation_name} was cancelled"
+                )
+                raise
+            except (RuntimeError, ValueError) as exc:
+                recovered = await recover_pane(conn.pane_id)
+                self._record_recovery(
+                    conn, recovered, f"{operation_name} failed: {exc}"
+                )
+                suffix = "pane recovered" if recovered else "connection is unresponsive"
+                raise SessionError(f"remote run failed: {exc}; {suffix}.") from exc
+
+            if result.timed_out:
+                recovered = await recover_pane(conn.pane_id)
+                result.pane_recovered = recovered
+                self._record_recovery(
+                    conn,
+                    recovered,
+                    f"{operation_name} timed out after {timeout:g}s",
+                )
+            elif result.cwd is not None:
+                conn.cwd = result.cwd
+            return result
+
+    @staticmethod
+    def _record_error(conn: Connection, message: str) -> None:
+        conn.last_error = message[-LAST_ERROR_LIMIT:]
+
+    def _record_recovery(self, conn: Connection, recovered: bool, message: str) -> None:
+        self._record_error(conn, message)
+        if not recovered:
+            conn.state = "unresponsive"
+
+    @staticmethod
+    def _ensure_usable(conn: Connection) -> None:
+        if conn.state == "unresponsive":
+            raise SessionError(
+                f"Connection {conn.connection_id!r} is unresponsive after failed "
+                "pane recovery. Call remote_disconnect, then remote_connect."
+            )
+        if conn.state == "closing":
+            raise SessionError(f"Connection {conn.connection_id!r} is closing.")
 
     async def disconnect(self, connection_id: str) -> dict:
-        conn = self._connections.pop(connection_id, None)
+        conn = self._connections.get(connection_id)
         if conn is None:
             return {"closed": False, "reason": "no such connection"}
 
-        # Try a graceful exit first so the user sees the SSH session close.
-        try:
-            await run_in_pane(conn.pane_id, "exit", timeout=3)
-        except Exception:
-            pass
-
-        await _tmux("kill-window", "-t", conn.window_id)
-        # If session has zero windows, tmux auto-closes it.
+        async with conn.lock:
+            conn.state = "closing"
+            conn.current_operation = "disconnect"
+            conn.last_activity_at = _now()
+            task = asyncio.create_task(kill_window(conn.window_id))
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                await task
+                self._connections.pop(connection_id, None)
+                raise
+            except (TmuxError, ValueError) as exc:
+                conn.state = "unresponsive"
+                conn.current_operation = None
+                self._record_error(conn, f"disconnect failed: {exc}")
+                raise SessionError(f"Could not close connection: {exc}") from exc
+            self._connections.pop(connection_id, None)
         return {"closed": True}
 
     def get(self, connection_id: str) -> Connection:
@@ -469,6 +719,7 @@ class SessionManager:
                 f"No active connection {connection_id!r}. "
                 f"Call remote_connect first, or check remote_status()."
             )
+        self._ensure_usable(conn)
         return conn
 
     def list_connections(self) -> list[dict]:
@@ -487,6 +738,10 @@ class SessionManager:
                 "ssh_add_exit_code": c.ssh_add_exit_code,
                 "ssh_add_output": c.ssh_add_output,
                 "forwarded_agent_present": c.forwarded_agent_present,
+                "state": c.state,
+                "current_operation": c.current_operation,
+                "last_activity_at": c.last_activity_at,
+                "last_error": c.last_error,
             }
             for c in self._connections.values()
         ]

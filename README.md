@@ -28,9 +28,10 @@ You can `tmux attach -t remote-ssh-mcp/<host>` at any time to watch.
 
 ## Status
 
-Alpha. The current release ships with single-window-per-connection
-serialization and a 1MB cap on single-file reads. See
-[Limitations](#limitations).
+Alpha. The current release ships with explicit connection lifecycle state,
+automatic pane recovery after command timeouts, single-window-per-connection
+serialization, and 1 MB caps on individual command responses and file reads.
+See [Limitations](#limitations).
 
 ## Install
 
@@ -211,8 +212,8 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 |---|---|---|
 | `remote_connect(host, project_path?, label?, agent_forwarding?, ssh_add_paths?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning, forwarded_agent_present, ssh_add_paths, ssh_add_exit_code, ssh_add_output}`. |
 | `remote_disconnect(connection_id)` | — | Closes window. Closes session if last window. |
-| `remote_status()` | — | Lists active connections. |
-| `remote_run(connection_id, cmd, timeout?)` | Shell | Persistent shell with multi-line command and heredoc support. Returns `{stdout, exit_code, duration_ms}`. |
+| `remote_status()` | — | Lists active connections with lifecycle and recent activity details. |
+| `remote_run(connection_id, cmd, timeout?)` | Shell | Persistent shell with multi-line command and heredoc support. Reports timeout, truncation, and pane recovery when applicable. |
 | `remote_read(connection_id, path, offset?, limit?)` | Read | Base64 round-trip through tmux. ≤1 MB. |
 | `remote_write(connection_id, path, content)` | Write | Streams without terminal echo; verifies size and SHA-256 before atomic replace. |
 | `remote_edit(connection_id, path, old, new, replace_all?)` | Edit | Exact single- or multi-line match; errors if `old` is non-unique unless `replace_all=true`. |
@@ -239,6 +240,11 @@ bulk `ssh-add <paths...>` returns non-zero. The response includes the expanded
 `ssh_add_paths`, `ssh_add_exit_code`, and `ssh_add_output` so the agent can tell
 you which requested paths may need checking before reconnecting.
 
+**A command timed out.** `remote_run` interrupts the foreground command and
+probes the shell before returning. A `pane_recovered=true` result means the
+connection remains usable. If recovery fails, `remote_status` marks the
+connection `unresponsive`; disconnect it and create a fresh connection.
+
 **How are writes verified?** The pane shows concise start and completion
 messages, while the payload is streamed to a no-echo receiver. The receiver
 checks the decoded byte count and SHA-256 before atomically replacing the
@@ -256,6 +262,8 @@ to your window. Check the parent's prompt to subagents.
 - **One pane per connection, serialized calls.** Parallel calls on the same
   `connection_id` queue. Use separate connections (subagents) for parallelism,
   or `nohup … &` for true background work.
+- **Single `remote_run` responses are capped at 1 MB.** When output is larger,
+  the response preserves its beginning and end and sets `truncated=true`.
 - **Single `remote_read` calls are capped at ~1 MB.** Read larger files in
   chunks with `offset` and `limit`; `remote_edit` chunks internally for UTF-8
   text files.

@@ -1,16 +1,4 @@
-"""Send a command into a tmux pane, wait for it to finish, return clean stdout + exit code.
-
-The mechanism: wrap the user's command with two unique sentinels (BEGIN/END), paste
-the wrapped command into the pane via tmux's load-buffer/paste-buffer (which handles
-arbitrary length cleanly), then poll capture-pane until the END sentinel — with the
-substituted exit code — appears in the scrollback. Output is everything between the
-BEGIN and END sentinel lines.
-
-The sentinels embed the marker via a shell variable (e.g. `${RSM_M}`) so the line
-where bash *echoes the command at the prompt* contains the literal `${RSM_M}` and
-`$?`, while the line where `echo` actually runs contains the substituted values.
-That difference is what lets us distinguish the prompt-echo from the real output.
-"""
+"""Run commands through persistent tmux panes with bounded marker polling."""
 
 from __future__ import annotations
 
@@ -18,121 +6,15 @@ import asyncio
 import re
 import secrets
 import shlex
-import subprocess
 import time
 from dataclasses import dataclass
 
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*\x07")
-TMUX_IO_TIMEOUT = 15.0
+from .tmux import capture_pane, paste_text, send_keys
 
-
-def _strip_ansi(s: str) -> str:
-    return ANSI_RE.sub("", s)
-
-
-async def _tmux(
-    *args: str,
-    stdin: bytes | None = None,
-    timeout: float | None = None,
-) -> tuple[int, bytes, bytes]:
-    proc = await asyncio.create_subprocess_exec(
-        "tmux",
-        *args,
-        stdin=subprocess.PIPE if stdin is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    try:
-        if timeout is None:
-            out, err = await proc.communicate(stdin)
-        else:
-            out, err = await asyncio.wait_for(proc.communicate(stdin), timeout)
-    except asyncio.TimeoutError:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-        command = " ".join(args[:2])
-        raise RuntimeError(f"tmux {command} timed out after {timeout:g}s") from None
-    except asyncio.CancelledError:
-        if proc.returncode is None:
-            proc.kill()
-        await proc.wait()
-        raise
-    return proc.returncode or 0, out, err
-
-
-async def capture_pane(target: str, lines: int = 20000) -> str:
-    """Capture pane scrollback (most recent `lines` lines), joined and ANSI-stripped."""
-    rc, out, err = await _tmux(
-        "capture-pane", "-t", target, "-p", "-J", "-S", f"-{lines}"
-    )
-    if rc != 0:
-        raise RuntimeError(f"tmux capture-pane failed: {err.decode(errors='replace')}")
-    return _strip_ansi(out.decode("utf-8", errors="replace"))
-
-
-async def _load_and_paste(
-    target: str,
-    payload: bytes,
-    *,
-    bracketed: bool,
-    timeout: float = TMUX_IO_TIMEOUT,
-) -> None:
-    """Load bytes into a private tmux buffer and paste them into a pane."""
-    buf = f"rsm-{secrets.token_hex(4)}"
-
-    async def delete_buffer() -> None:
-        try:
-            await _tmux("delete-buffer", "-b", buf, timeout=timeout)
-        except RuntimeError:
-            pass
-
-    rc, _, err = await _tmux(
-        "load-buffer", "-b", buf, "-", stdin=payload, timeout=timeout
-    )
-    if rc != 0:
-        raise RuntimeError(f"tmux load-buffer failed: {err.decode(errors='replace')}")
-
-    args = ["paste-buffer", "-r"]
-    if bracketed:
-        args.append("-p")
-    args.extend(["-b", buf, "-d", "-t", target])
-    try:
-        rc, _, err = await _tmux(*args, timeout=timeout)
-    except asyncio.CancelledError:
-        await asyncio.shield(delete_buffer())
-        raise
-    except Exception:
-        await delete_buffer()
-        raise
-    if rc != 0:
-        await delete_buffer()
-        raise RuntimeError(f"tmux paste-buffer failed: {err.decode(errors='replace')}")
-
-
-async def paste_text(
-    target: str,
-    text: str,
-    with_enter: bool = True,
-    timeout: float = TMUX_IO_TIMEOUT,
-) -> None:
-    """Paste a shell command using bracketed-paste-aware tmux input."""
-    await _load_and_paste(target, text.encode("utf-8"), bracketed=True, timeout=timeout)
-    if with_enter:
-        rc, _, err = await _tmux("send-keys", "-t", target, "Enter", timeout=timeout)
-        if rc != 0:
-            raise RuntimeError(
-                f"tmux send-keys Enter failed: {err.decode(errors='replace')}"
-            )
-
-
-async def paste_bytes(
-    target: str,
-    payload: bytes,
-    timeout: float = TMUX_IO_TIMEOUT,
-) -> None:
-    """Paste raw bytes for a program already reading directly from the pane."""
-    await _load_and_paste(target, payload, bracketed=False, timeout=timeout)
+RUN_POLL_CAPTURE_LINES = 200
+PANE_HISTORY_LIMIT = 1_100_000
+RUN_FINAL_CAPTURE_LINES = PANE_HISTORY_LIMIT
+PANE_RECOVERY_TIMEOUT = 8.0
 
 
 @dataclass
@@ -141,6 +23,8 @@ class RunResult:
     exit_code: int
     duration_ms: int
     timed_out: bool = False
+    cwd: str | None = None
+    pane_recovered: bool | None = None
 
 
 async def run_in_pane(
@@ -155,16 +39,23 @@ async def run_in_pane(
     The complete command is quoted into the single wrapper submission so
     embedded newlines cannot become separate interactive shell submissions.
     """
-    marker = secrets.token_hex(8)
+    if timeout <= 0:
+        raise ValueError("remote command timeout must be > 0")
+    if poll_interval <= 0:
+        raise ValueError("remote command poll interval must be > 0")
+
+    marker_left = secrets.token_hex(8)
+    marker_right = secrets.token_hex(8)
+    marker = marker_left + marker_right
     begin_literal = f"__RSM_BEGIN_{marker}__"
-    end_re = re.compile(rf"^__RSM_END_{re.escape(marker)}_(\d+)__\s*$", re.MULTILINE)
-    # The remote PTY can occasionally render the command echo and the first
-    # echo output on the same visual line. The expanded marker is still unique:
-    # the echoed command contains `${RSM_M}`, while real output contains the
-    # random marker value.
+    end_re = re.compile(rf"^__RSM_END_{re.escape(marker)}_(\d+)__$", re.MULTILINE)
+    cwd_re = re.compile(rf"^__RSM_CWD_{re.escape(marker)}__ (.*)$", re.MULTILINE)
+    # The remote PTY can render the command echo and first output on the same
+    # visual line. The echoed wrapper keeps the random halves separated while
+    # executed output joins them, so only the latter contains the full marker.
     begin_re = re.compile(re.escape(begin_literal))
 
-    wrapped = _wrap_command(marker, user_cmd)
+    wrapped = _wrap_command(marker_left, user_cmd, marker_right=marker_right)
 
     start = time.monotonic()
     await paste_text(target, wrapped)
@@ -180,28 +71,39 @@ async def run_in_pane(
                 timed_out=True,
             )
 
-        screen = await capture_pane(target)
+        screen = await capture_pane(target, lines=RUN_POLL_CAPTURE_LINES)
         last_screen = screen
         m = end_re.search(screen)
-        if m and begin_re.search(screen[: m.start()]):
-            # Both sentinels are present — declare done. We *require* BEGIN
-            # before bailing, because tmux's grid is sometimes a tick behind
-            # the bytes streaming in: a single capture-pane call can show END
-            # while BEGIN hasn't yet propagated. Without this guard,
-            # _extract_output would fall back to the screen tail (banner +
-            # stale prior markers) and the caller would see a bogus stdout.
+        cwd_match = cwd_re.search(screen, m.end() if m else 0)
+        if m and cwd_match:
+            screen = await capture_pane(target, lines=RUN_FINAL_CAPTURE_LINES)
+            m = end_re.search(screen)
+            cwd_match = cwd_re.search(screen, m.end() if m else 0)
+            if m is None or cwd_match is None:
+                raise RuntimeError("tmux pane lost command completion markers")
+            begin_match = begin_re.search(screen[: m.start()])
+            if begin_match is None:
+                raise RuntimeError(
+                    "command output exceeded available tmux history before completion"
+                )
             exit_code = int(m.group(1))
             stdout = _extract_output(screen, begin_re, m.start())
             return RunResult(
                 stdout=stdout,
                 exit_code=exit_code,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                cwd=cwd_match.group(1),
             )
 
         await asyncio.sleep(poll_interval)
 
 
-def _wrap_command(marker: str, user_cmd: str) -> str:
+def _wrap_command(
+    marker: str,
+    user_cmd: str,
+    *,
+    marker_right: str = "",
+) -> str:
     """Build one wrapper submission while preserving the command's shell syntax."""
     if "\x00" in user_cmd:
         raise ValueError("remote command must not contain NUL characters")
@@ -214,14 +116,36 @@ def _wrap_command(marker: str, user_cmd: str) -> str:
         raise ValueError("remote command must not be empty")
 
     return (
-        f'RSM_M="{marker}"; '
-        f'echo "__RSM_BEGIN_${{RSM_M}}__"; '
-        f"__rsm_cmd={shlex.quote(normalized_cmd)}; "
-        f'eval "$__rsm_cmd"; '
-        f"__rsm_rc=$?; "
-        f'RSM_M="{marker}"; '
-        f'echo "__RSM_END_${{RSM_M}}_${{__rsm_rc}}__"'
+        f"printf '%s%s%s%s\\n' '__RSM_BEGIN_' {shlex.quote(marker)} "
+        f"{shlex.quote(marker_right)} '__'; "
+        f"eval {shlex.quote(normalized_cmd)}; "
+        f"printf '\\n%s%s%s_%s%s\\n' '__RSM_END_' {shlex.quote(marker)} "
+        f'{shlex.quote(marker_right)} "$?" "__"; '
+        f"printf '%s%s%s%s %s\\n' '__RSM_CWD_' {shlex.quote(marker)} "
+        f"{shlex.quote(marker_right)} '__' \"$PWD\""
     )
+
+
+async def recover_pane(target: str, timeout: float = PANE_RECOVERY_TIMEOUT) -> bool:
+    """Interrupt a foreground command, restore tty settings, and probe the shell."""
+    deadline = time.monotonic() + timeout
+    try:
+        for _ in range(2):
+            await send_keys(
+                target, "C-c", timeout=max(0.1, deadline - time.monotonic())
+            )
+            await asyncio.sleep(0.15)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        probe = await run_in_pane(
+            target,
+            "stty sane >/dev/null 2>&1 || true",
+            timeout=remaining,
+        )
+    except (RuntimeError, ValueError):
+        return False
+    return not probe.timed_out and probe.exit_code == 0
 
 
 def _extract_output(screen: str, begin_re: re.Pattern[str], end_pos: int) -> str:
