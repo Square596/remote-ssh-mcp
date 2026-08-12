@@ -275,9 +275,9 @@ async def read_remote_file(
             f"pieces using offset/limit."
         )
 
-    # Single-line python — must avoid block constructs (with/try/def/for) since
-    # the runner collapses any newlines to `; ` to keep the wrapped command on
-    # one line. We use expression form (open(...).read()) instead of `with`.
+    # Keep this helper compact and single-line so its shell-visible bootstrap
+    # remains easy to inspect. Use expression form (open(...).read()) instead
+    # of block constructs such as `with`.
     py_one_line = (
         "import base64,os,sys; "
         f"p={path!r}; o={offset}; n={limit}; "

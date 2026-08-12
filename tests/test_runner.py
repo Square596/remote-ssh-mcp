@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -55,9 +57,84 @@ def test_wrap_command_accepts_background_command() -> None:
     assert f"__RSM_END_{marker}_0__" in proc.stdout
 
 
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_wrap_command_preserves_multiline_shell_syntax_and_state(
+    shell: str, tmp_path
+) -> None:
+    shell_path = shutil.which(shell)
+    if shell_path is None:
+        pytest.skip(f"{shell} is required")
+
+    marker = "abc123"
+    command = (
+        "\n"
+        "export RSM_MULTILINE='kept'\n"
+        "for item in alpha beta; do\n"
+        "  printf 'item:%s\\n' \"$item\"\n"
+        "done\n"
+        "\n"
+        "cat <<'RSM_HEREDOC'\n"
+        "literal:$RSM_MULTILINE\n"
+        "single-quote:' backslash:\\\n"
+        "RSM_HEREDOC\n"
+        f"cd {shlex.quote(str(tmp_path))}\n"
+    )
+    wrapped = _wrap_command(marker, command)
+
+    proc = subprocess.run(
+        [
+            shell_path,
+            "-fc",
+            f'{wrapped}; printf "STATE:%s:%s\\n" "$PWD" "$RSM_MULTILINE"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "item:alpha\nitem:beta" in proc.stdout
+    assert "literal:$RSM_MULTILINE" in proc.stdout
+    assert "single-quote:' backslash:\\" in proc.stdout
+    assert f"__RSM_END_{marker}_0__" in proc.stdout
+    assert f"STATE:{tmp_path}:kept" in proc.stdout
+
+
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_wrap_command_reports_multiline_final_exit_status(shell: str) -> None:
+    shell_path = shutil.which(shell)
+    if shell_path is None:
+        pytest.skip(f"{shell} is required")
+
+    marker = "abc123"
+    wrapped = _wrap_command(marker, "printf 'before-failure\\n'\n\nfalse\n")
+    proc = subprocess.run(
+        [shell_path, "-fc", wrapped],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "before-failure" in proc.stdout
+    assert f"__RSM_END_{marker}_1__" in proc.stdout
+
+
+def test_wrap_command_normalizes_text_line_endings() -> None:
+    wrapped = _wrap_command("abc123", "printf first\r\nprintf second\r")
+
+    assert "\r" not in wrapped
+    assert "printf first\nprintf second\n" in wrapped
+
+
 def test_wrap_command_rejects_empty_command() -> None:
     with pytest.raises(ValueError, match="must not be empty"):
         _wrap_command("abc123", " \t")
+
+
+def test_wrap_command_rejects_nul_character() -> None:
+    with pytest.raises(ValueError, match="must not contain NUL"):
+        _wrap_command("abc123", "printf 'before'\x00printf 'after'")
 
 
 @pytest.mark.asyncio

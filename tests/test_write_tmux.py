@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -64,6 +65,42 @@ def tmux_pane(request):
 def _payload(size: int) -> bytes:
     seed = b"RSM_PAYLOAD_MUST_NOT_APPEAR_IN_THE_PANE_0123456789\n"
     return (seed * ((size // len(seed)) + 1))[:size]
+
+
+@pytest.mark.asyncio
+async def test_multiline_run_supports_heredocs_and_preserves_state(tmux_pane, tmp_path):
+    shell, pane_id = tmux_pane
+    command = (
+        "export RSM_MULTILINE_STATE=kept\n"
+        "for item in alpha beta; do\n"
+        "  printf 'item:%s\\n' \"$item\"\n"
+        "done\n"
+        "cat <<'RSM_HEREDOC'\n"
+        "literal:$RSM_MULTILINE_STATE\n"
+        "RSM_HEREDOC\n"
+        f"cd {shlex.quote(str(tmp_path))}\n"
+    )
+
+    result = await run_in_pane(pane_id, command, timeout=10)
+    state = await run_in_pane(
+        pane_id,
+        'printf "STATE:%s:%s\\n" "$PWD" "$RSM_MULTILINE_STATE"',
+        timeout=10,
+    )
+    failure = await run_in_pane(
+        pane_id, "printf 'before-failure\\n'\nfalse\n", timeout=10
+    )
+
+    assert result.exit_code == 0, (shell, result.stdout)
+    assert result.stdout.splitlines() == [
+        "item:alpha",
+        "item:beta",
+        "literal:$RSM_MULTILINE_STATE",
+    ]
+    assert state.exit_code == 0, (shell, state.stdout)
+    assert state.stdout == f"STATE:{tmp_path}:kept"
+    assert failure.exit_code == 1, (shell, failure.stdout)
+    assert failure.stdout == "before-failure"
 
 
 @pytest.mark.asyncio

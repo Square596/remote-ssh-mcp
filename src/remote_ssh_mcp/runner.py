@@ -151,10 +151,9 @@ async def run_in_pane(
 ) -> RunResult:
     """Run user_cmd in the pane, return clean stdout + exit code.
 
-    user_cmd should be a single-line shell snippet (compound commands with
-    `;`, `&&`, `||`, pipes are fine). For multi-line scripts, write a file
-    via remote_write and execute it. Embedded literal newlines are stripped
-    here so a command cannot be split into separate shell submissions.
+    Single-line snippets and multi-line shell programs are both supported.
+    The complete command is quoted into the single wrapper submission so
+    embedded newlines cannot become separate interactive shell submissions.
     """
     marker = secrets.token_hex(8)
     begin_literal = f"__RSM_BEGIN_{marker}__"
@@ -203,17 +202,21 @@ async def run_in_pane(
 
 
 def _wrap_command(marker: str, user_cmd: str) -> str:
-    """Build the single shell line pasted into the pane for a user command."""
-    # Strict single-line wrapping. Newlines in user_cmd would cause the paste
-    # to be split into multiple shell lines, breaking sentinel ordering.
-    safe_user_cmd = user_cmd.replace("\n", "; ").replace("\r", "")
-    if not safe_user_cmd.strip():
+    """Build one wrapper submission while preserving the command's shell syntax."""
+    if "\x00" in user_cmd:
+        raise ValueError("remote command must not contain NUL characters")
+
+    # MCP command text may arrive with platform-native line endings. Shells use
+    # LF as the grammar delimiter, so normalize text line endings before quoting
+    # the complete program into one assignment in the wrapper.
+    normalized_cmd = user_cmd.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized_cmd.strip():
         raise ValueError("remote command must not be empty")
 
     return (
         f'RSM_M="{marker}"; '
         f'echo "__RSM_BEGIN_${{RSM_M}}__"; '
-        f"__rsm_cmd={shlex.quote(safe_user_cmd)}; "
+        f"__rsm_cmd={shlex.quote(normalized_cmd)}; "
         f'eval "$__rsm_cmd"; '
         f"__rsm_rc=$?; "
         f'RSM_M="{marker}"; '

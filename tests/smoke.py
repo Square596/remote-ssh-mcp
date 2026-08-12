@@ -64,11 +64,20 @@ async def main(host: str, work_dir: str, second_dir: str, missing_dir: str) -> i
     if "RSM_TEST=42" not in r.stdout or work_dir not in r.stdout:
         failures.append("shell state did not persist across calls")
 
-    step("remote_run: multi-line stdout")
-    r = await run_in_pane(conn.pane_id, "for i in 1 2 3 4 5; do echo line$i; done")
+    step("remote_run: multi-line command and heredoc")
+    r = await run_in_pane(
+        conn.pane_id,
+        "for i in 1 2 3 4 5; do\n"
+        "  echo line$i\n"
+        "done\n"
+        "cat <<'RSM_HEREDOC'\n"
+        "literal:$HOME\n"
+        "RSM_HEREDOC\n",
+    )
     print(r.stdout)
-    if r.stdout.strip().splitlines() != [f"line{i}" for i in range(1, 6)]:
-        failures.append(f"multi-line stdout mismatch: {r.stdout!r}")
+    expected_lines = [f"line{i}" for i in range(1, 6)] + ["literal:$HOME"]
+    if r.stdout.strip().splitlines() != expected_lines:
+        failures.append(f"multi-line command mismatch: {r.stdout!r}")
 
     step("remote_run: command with embedded special chars")
     r = await run_in_pane(conn.pane_id, """echo "hello 'world' \\$HOME=$HOME" """)
@@ -257,17 +266,30 @@ async def main(host: str, work_dir: str, second_dir: str, missing_dir: str) -> i
     else:
         print("stress OK (20/20 round-trips passed)")
 
-    step("multi-line cmd is rejected by remote_run via server.py")
+    step("multi-line cmd works through remote_run via server.py")
     # FastMCP exposes the underlying tool function via `.fn` on newer versions
     # and as the bare function on older versions; cope with both.
+    from remote_ssh_mcp import server as server_module
     from remote_ssh_mcp.server import remote_run as _rr
 
+    server_module.sessions = sm
     rr_callable = getattr(_rr, "fn", _rr)
-    res = await rr_callable(connection_id=conn.connection_id, cmd="echo a\necho b")
-    if res.get("ok") is not False or "multi-line" not in res.get("error", "").lower():
-        failures.append(f"expected multi-line rejection, got {res!r}")
+    res = await rr_callable(
+        connection_id=conn.connection_id,
+        cmd="export RSM_MULTILINE_SMOKE=kept\necho first\necho second\nfalse\n",
+    )
+    if (
+        res.get("ok") is not True
+        or res.get("stdout", "").splitlines() != ["first", "second"]
+        or res.get("exit_code") != 1
+    ):
+        failures.append(f"expected successful multi-line execution, got {res!r}")
     else:
-        print("multi-line cmd rejected correctly")
+        state = await run_in_pane(conn.pane_id, 'echo "$RSM_MULTILINE_SMOKE"')
+        if state.stdout.strip() != "kept":
+            failures.append("multi-line command did not preserve exported state")
+        else:
+            print("multi-line cmd and state persistence OK")
 
     step("disconnect (sub then main)")
     await sm.disconnect(sub.connection_id)

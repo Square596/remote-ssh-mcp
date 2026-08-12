@@ -39,6 +39,52 @@ async def test_remote_run_rejects_empty_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_remote_run_rejects_nul_before_connection_lookup() -> None:
+    result = await tool_fn(server.remote_run)(
+        connection_id="unused", cmd="printf before\x00printf after"
+    )
+
+    assert result["ok"] is False
+    assert "NUL" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_remote_run_accepts_multiline_command(monkeypatch) -> None:
+    command = 'for item in a b; do\n  echo "$item"\ndone\n'
+    captured: dict[str, object] = {}
+
+    class FakeSessions:
+        def get(self, connection_id):
+            assert connection_id == "conn"
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+    async def fake_run_in_pane(pane_id, cmd, timeout=60):
+        captured.update(pane_id=pane_id, cmd=cmd, timeout=timeout)
+        return SimpleNamespace(
+            stdout="a\nb",
+            exit_code=0,
+            duration_ms=12,
+            timed_out=False,
+        )
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+    monkeypatch.setattr(server, "run_in_pane", fake_run_in_pane)
+
+    result = await tool_fn(server.remote_run)(
+        connection_id="conn", cmd=command, timeout=15
+    )
+
+    assert captured == {"pane_id": "%1", "cmd": command, "timeout": 15.0}
+    assert result == {
+        "ok": True,
+        "stdout": "a\nb",
+        "exit_code": 0,
+        "duration_ms": 12,
+        "timed_out": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_remote_grep_caps_rg_output_with_head(monkeypatch) -> None:
     captured: dict[str, str] = {}
 

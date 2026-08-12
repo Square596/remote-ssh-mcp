@@ -66,6 +66,36 @@ async def test_edit_remote_file_reads_all_chunks_before_writing(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_edit_remote_file_replaces_multiline_exact_match(monkeypatch) -> None:
+    original = b"before\nalpha\nbeta\nafter\n"
+    expected = b"before\none\ntwo\nthree\nafter\n"
+    writes: list[bytes] = []
+
+    async def fake_read_entire_remote_file(pane_id, path):
+        assert (pane_id, path) == ("pane", "/remote/file.txt")
+        return original
+
+    async def fake_write_remote_file(pane_id, path, content):
+        assert (pane_id, path) == ("pane", "/remote/file.txt")
+        writes.append(content)
+        return len(content)
+
+    monkeypatch.setattr(files, "read_entire_remote_file", fake_read_entire_remote_file)
+    monkeypatch.setattr(files, "write_remote_file", fake_write_remote_file)
+
+    result = await edit_remote_file(
+        "pane",
+        "/remote/file.txt",
+        old="alpha\nbeta",
+        new="one\ntwo\nthree",
+    )
+
+    assert writes == [expected]
+    assert result.occurrences_replaced == 1
+    assert result.bytes_after == len(expected)
+
+
+@pytest.mark.asyncio
 async def test_edit_remote_file_rejects_empty_old() -> None:
     with pytest.raises(FileOpError, match="old must not be empty"):
         await edit_remote_file("pane", "/remote/file.txt", old="", new="x")
