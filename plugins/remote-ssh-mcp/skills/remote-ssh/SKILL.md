@@ -38,10 +38,9 @@ paste it verbatim, and ask for the correct project path before doing work.
 | Search text | `remote_grep(connection_id, pattern, path?, glob?)` |
 | Find files | `remote_glob(connection_id, pattern, path?)` |
 
-`remote_run` keeps cwd/env state and accepts one shell line only. Use
-`remote_write` to create scripts or heredoc bodies, then run them with
-`remote_run`. `remote_edit` is exact-string replacement; make `old` unique or
-use `replace_all=true`.
+`remote_run` accepts single- or multi-line shell commands, including heredocs,
+and keeps cwd/env state. `remote_edit` accepts multi-line exact strings; make
+`old` unique or use `replace_all=true`.
 
 Local shell tools are only for local-side work, such as `scp`/`rsync` config
 transfer. Do not use local filesystem or shell tools to inspect or edit the

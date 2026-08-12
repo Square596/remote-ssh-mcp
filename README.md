@@ -212,10 +212,10 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 | `remote_connect(host, project_path?, label?, agent_forwarding?, ssh_add_paths?)` | — | Opens new tmux window. Returns `{connection_id, host, cwd, agent_warning, forwarded_agent_present, ssh_add_paths, ssh_add_exit_code, ssh_add_output}`. |
 | `remote_disconnect(connection_id)` | — | Closes window. Closes session if last window. |
 | `remote_status()` | — | Lists active connections. |
-| `remote_run(connection_id, cmd, timeout?)` | Bash | Persistent shell. Returns `{stdout, exit_code, duration_ms}`. |
+| `remote_run(connection_id, cmd, timeout?)` | Shell | Persistent shell with multi-line command and heredoc support. Returns `{stdout, exit_code, duration_ms}`. |
 | `remote_read(connection_id, path, offset?, limit?)` | Read | Base64 round-trip through tmux. ≤1 MB. |
 | `remote_write(connection_id, path, content)` | Write | Streams without terminal echo; verifies size and SHA-256 before atomic replace. |
-| `remote_edit(connection_id, path, old, new, replace_all?)` | Edit | Exact match, errors if `old` is non-unique unless `replace_all=true`. |
+| `remote_edit(connection_id, path, old, new, replace_all?)` | Edit | Exact single- or multi-line match; errors if `old` is non-unique unless `replace_all=true`. |
 | `remote_grep(connection_id, pattern, path?, glob?)` | Grep | Uses `rg` if available, else `grep -r`. |
 | `remote_glob(connection_id, pattern, path?)` | Glob | Uses `find`. |
 

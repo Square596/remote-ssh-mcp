@@ -84,23 +84,13 @@ async def remote_status() -> dict:
 
 @mcp.tool()
 async def remote_run(connection_id: str, cmd: str, timeout: int = 60) -> dict:
-    """Run one shell line in the persistent remote session. Cwd/env state is
-    preserved. For scripts or heredocs, write a file first with `remote_write`.
+    """Run shell commands in the persistent remote session. Multi-line scripts
+    and heredocs are supported, and cwd/env state is preserved across calls.
     """
-    if "\n" in cmd or "\r" in cmd:
-        return _err(
-            "remote_run rejects multi-line commands. The tmux paste-buffer "
-            "converts newlines to CR mid-paste, which corrupts heredocs and "
-            "command continuation — the shell will wedge at the `>` "
-            "secondary prompt and require remote_disconnect to recover.\n\n"
-            "Workarounds:\n"
-            "  - Compound on one line:  cmd1 && cmd2 && cmd3\n"
-            "  - For multi-line scripts: remote_write the script to a file, "
-            "then remote_run to execute it.\n"
-            "  - For heredocs: same — write the document body via remote_write."
-        )
     if not cmd.strip():
         return _err("remote_run rejects empty commands.")
+    if "\x00" in cmd:
+        return _err("remote_run rejects commands containing NUL characters.")
 
     try:
         conn = sessions.get(connection_id)
