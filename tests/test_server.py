@@ -39,6 +39,69 @@ async def test_mcp_registers_expected_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_modern_sdks_receive_output_schemas_and_tool_annotations() -> None:
+    tools = {
+        tool.name: tool.model_dump(by_alias=True, exclude_none=True)
+        for tool in await server.mcp.list_tools()
+    }
+    run_tool = tools["remote_run"]
+
+    # MCP SDK 1.2 predates both decorator options. The compatibility matrix
+    # exercises that fallback; newer 1.x and 2.x SDKs exercise these assertions.
+    if "outputSchema" not in run_tool:
+        assert "annotations" not in run_tool
+        return
+
+    assert run_tool["outputSchema"]["type"] == "object"
+    assert run_tool["outputSchema"]["required"] == ["ok"]
+    assert "stdout" in run_tool["outputSchema"]["properties"]
+    assert run_tool["annotations"] == {
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": True,
+    }
+    assert tools["remote_read"]["annotations"]["readOnlyHint"] is True
+    assert tools["remote_disconnect"]["annotations"]["destructiveHint"] is True
+
+
+@pytest.mark.asyncio
+async def test_modern_structured_output_keeps_success_diagnostics_sparse(
+    monkeypatch,
+) -> None:
+    tool_metadata = {
+        tool.name: tool.model_dump(by_alias=True, exclude_none=True)
+        for tool in await server.mcp.list_tools()
+    }
+    if "outputSchema" not in tool_metadata["remote_write"]:
+        return
+
+    class FakeSessions(OperationSessions):
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+    async def fake_write(pane_id, path, content):
+        return len(content)
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+    monkeypatch.setattr(server, "write_remote_file", fake_write)
+
+    result = await server.mcp.call_tool(
+        "remote_write",
+        {"connection_id": "conn", "path": "file.txt", "content": "hello"},
+    )
+
+    structured_content = getattr(result, "structured_content", None)
+    if structured_content is None:
+        structured_content = result.structuredContent
+    assert structured_content == {
+        "ok": True,
+        "path": "file.txt",
+        "bytes_written": 5,
+    }
+
+
+@pytest.mark.asyncio
 async def test_remote_run_rejects_empty_command() -> None:
     result = await tool_fn(server.remote_run)(connection_id="unused", cmd=" \t")
 
@@ -94,7 +157,7 @@ async def test_remote_run_accepts_multiline_command(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_remote_grep_caps_rg_output_with_head(monkeypatch) -> None:
+async def test_remote_grep_reports_exact_truncation(monkeypatch) -> None:
     captured: dict[str, str] = {}
 
     class FakeSessions:
@@ -108,8 +171,10 @@ async def test_remote_grep_caps_rg_output_with_head(monkeypatch) -> None:
             assert operation_name == "grep"
             captured["cmd"] = cmd
             return SimpleNamespace(
-                stdout="a\nb\nc\n",
+                stdout="a\nb\nc\nd\n",
                 timed_out=False,
+                exit_code=0,
+                pane_recovered=None,
             )
 
     monkeypatch.setattr(server, "sessions", FakeSessions())
@@ -123,9 +188,99 @@ async def test_remote_grep_caps_rg_output_with_head(monkeypatch) -> None:
 
     assert result["ok"] is True
     assert result["count"] == 3
+    assert result["matches"] == ["a", "b", "c"]
     assert result["truncated"] is True
-    assert "| head -n 3" in captured["cmd"]
-    assert " -m 3 " not in captured["cmd"]
+    assert "python3 -c" in captured["cmd"]
+    assert "head -n" not in captured["cmd"]
+
+
+@pytest.mark.asyncio
+async def test_remote_grep_exact_limit_is_not_truncated(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+        async def run_command(self, conn, cmd, timeout, operation_name):
+            return SimpleNamespace(
+                stdout="a\nb\nc\n",
+                timed_out=False,
+                exit_code=0,
+                pane_recovered=None,
+            )
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    result = await tool_fn(server.remote_grep)(
+        connection_id="conn", pattern="needle", max_results=3
+    )
+
+    assert result == {
+        "ok": True,
+        "matches": ["a", "b", "c"],
+        "count": 3,
+        "truncated": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_remote_glob_reports_exact_truncation(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+        async def run_command(self, conn, cmd, timeout, operation_name):
+            return SimpleNamespace(
+                stdout="a.py\nb.py\nc.py\n",
+                timed_out=False,
+                exit_code=0,
+                pane_recovered=None,
+            )
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    result = await tool_fn(server.remote_glob)(
+        connection_id="conn", pattern="*.py", max_results=2
+    )
+
+    assert result == {
+        "ok": True,
+        "files": ["a.py", "b.py"],
+        "count": 2,
+        "truncated": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_remote_search_preserves_command_failures(monkeypatch) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+        async def run_command(self, conn, cmd, timeout, operation_name):
+            return SimpleNamespace(
+                stdout="permission denied\n",
+                timed_out=False,
+                exit_code=2,
+                pane_recovered=True,
+            )
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    grep_result = await tool_fn(server.remote_grep)(
+        connection_id="conn", pattern="needle"
+    )
+    glob_result = await tool_fn(server.remote_glob)(
+        connection_id="conn", pattern="*.py"
+    )
+
+    for operation, result in (("grep", grep_result), ("glob", glob_result)):
+        assert result == {
+            "ok": False,
+            "error": f"{operation} failed",
+            "exit_code": 2,
+            "partial_stdout": "permission denied\n",
+            "pane_recovered": True,
+        }
 
 
 def test_run_output_truncation_is_utf8_safe_and_exactly_bounded() -> None:
@@ -163,6 +318,27 @@ async def test_remote_grep_rejects_non_positive_max_results(monkeypatch) -> None
 
     assert result["ok"] is False
     assert "max_results must be > 0" in result["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["remote_grep", "remote_glob"])
+async def test_search_validates_max_before_connection_lookup(
+    monkeypatch, tool_name
+) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            raise AssertionError("connection lookup must not run")
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    result = await tool_fn(getattr(server, tool_name))(
+        connection_id="conn", pattern="needle", max_results=10_001
+    )
+
+    assert result == {
+        "ok": False,
+        "error": "max_results=10001 exceeds max 10000.",
+    }
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,7 @@ import pytest
 from remote_ssh_mcp import files
 from remote_ssh_mcp.files import FileOpError, write_remote_file
 from remote_ssh_mcp.runner import PANE_HISTORY_LIMIT, capture_pane, run_in_pane
+from remote_ssh_mcp.search import glob_command, grep_command
 from remote_ssh_mcp.session import Connection, SessionManager
 
 pytestmark = pytest.mark.skipif(
@@ -209,6 +210,55 @@ async def test_run_preserves_framing_beyond_previous_history_limit(tmux_pane):
 
     assert result.exit_code == 0, (shell, result.stdout[-1000:])
     assert len(result.stdout.splitlines()) == 100001
+
+
+@pytest.mark.asyncio
+async def test_bounded_search_commands_report_results_and_failures(tmux_pane, tmp_path):
+    shell, pane_id = tmux_pane
+    sample = tmp_path / "sample.txt"
+    sample.write_text("needle\nneedle\nneedle\nneedle\n", encoding="utf-8")
+    for name in ("a.py", "b.py", "c.py"):
+        (tmp_path / name).write_text(name, encoding="utf-8")
+
+    grep = await run_in_pane(
+        pane_id,
+        grep_command(
+            "needle",
+            str(sample),
+            glob=None,
+            case_insensitive=False,
+            limit=3,
+        ),
+        timeout=10,
+    )
+    no_matches = await run_in_pane(
+        pane_id,
+        grep_command(
+            "absent",
+            str(sample),
+            glob=None,
+            case_insensitive=False,
+            limit=3,
+        ),
+        timeout=10,
+    )
+    glob = await run_in_pane(
+        pane_id, glob_command("*.py", str(tmp_path), limit=3), timeout=10
+    )
+    missing = await run_in_pane(
+        pane_id,
+        glob_command("*.py", str(tmp_path / "missing"), limit=3),
+        timeout=10,
+    )
+
+    assert grep.exit_code == 0, (shell, grep.stdout)
+    assert len(grep.stdout.splitlines()) == 3
+    assert no_matches.exit_code == 0, (shell, no_matches.stdout)
+    assert no_matches.stdout == ""
+    assert glob.exit_code == 0, (shell, glob.stdout)
+    assert len(glob.stdout.splitlines()) == 3
+    assert missing.exit_code == 2, (shell, missing.stdout)
+    assert "missing" in missing.stdout
 
 
 @pytest.mark.asyncio
