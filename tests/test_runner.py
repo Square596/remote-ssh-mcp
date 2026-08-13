@@ -4,11 +4,16 @@ import re
 import shlex
 import shutil
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
 from remote_ssh_mcp import runner
-from remote_ssh_mcp.runner import _extract_output, _wrap_command
+from remote_ssh_mcp.runner import (
+    _extract_output,
+    _extract_partial_output,
+    _wrap_command,
+)
 
 
 def test_extract_output_accepts_begin_marker_glued_to_echoed_command() -> None:
@@ -24,6 +29,44 @@ def test_extract_output_accepts_begin_marker_glued_to_echoed_command() -> None:
     end_pos = screen.index("__RSM_END_abc123_0__")
 
     assert _extract_output(screen, begin_re, end_pos) == "payload"
+
+
+def test_extract_partial_output_ignores_history_and_protocol_framing() -> None:
+    marker = "leftright"
+    begin_re = re.compile(rf"__RSM_BEGIN_{marker}__")
+    end_re = re.compile(rf"^__RSM_END_{marker}_(\d+)__$", re.MULTILINE)
+    screen = (
+        "old prompt and output\n"
+        "printf '__RSM_BEGIN_' left right '__'\n"
+        "__RSM_BEGIN_leftright__\n"
+        "timeout-marker\n"
+        "\n\n"
+    )
+
+    assert _extract_partial_output(screen, begin_re, end_re) == "timeout-marker"
+
+
+def test_extract_partial_output_stops_at_late_completion_marker() -> None:
+    marker = "leftright"
+    begin_re = re.compile(rf"__RSM_BEGIN_{marker}__")
+    end_re = re.compile(rf"^__RSM_END_{marker}_(\d+)__$", re.MULTILINE)
+    screen = (
+        "__RSM_BEGIN_leftright__\n"
+        "completed-near-deadline\n"
+        "__RSM_END_leftright_0__\n"
+        "__RSM_CWD_leftright__ /tmp\n"
+    )
+
+    assert (
+        _extract_partial_output(screen, begin_re, end_re) == "completed-near-deadline"
+    )
+
+
+def test_extract_partial_output_requires_an_attributable_begin_marker() -> None:
+    begin_re = re.compile(r"__RSM_BEGIN_leftright__")
+    end_re = re.compile(r"^__RSM_END_leftright_(\d+)__$", re.MULTILINE)
+
+    assert _extract_partial_output("old prompt and output\n", begin_re, end_re) is None
 
 
 def test_wrap_command_accepts_trailing_semicolon_and_preserves_state(tmp_path) -> None:
@@ -199,3 +242,76 @@ async def test_run_polls_recent_lines_then_captures_full_output(monkeypatch) -> 
     assert result.stdout == "output without a user newline"
     assert result.exit_code == 0
     assert result.cwd == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_timeout_retries_history_without_leaking_unattributed_output(
+    monkeypatch,
+) -> None:
+    markers = iter(("left", "right"))
+    ticks = iter((0.0, 0.0, 0.02, 0.02))
+    captures: list[int] = []
+    recent = "old prompt and echoed wrapper\n"
+    full = (
+        "older pane history\n"
+        "printf '__RSM_BEGIN_' left right '__'\n"
+        "__RSM_BEGIN_leftright__\n"
+        "timeout-marker\n"
+        "\n\n"
+    )
+
+    async def fake_paste_text(target, text):
+        assert target == "%1"
+
+    async def fake_capture_pane(target, lines):
+        assert target == "%1"
+        captures.append(lines)
+        return recent if len(captures) == 1 else full
+
+    async def fake_sleep(delay):
+        assert delay == 0.02
+
+    monkeypatch.setattr(runner.secrets, "token_hex", lambda _: next(markers))
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    monkeypatch.setattr(runner, "asyncio", SimpleNamespace(sleep=fake_sleep))
+    monkeypatch.setattr(runner, "paste_text", fake_paste_text)
+    monkeypatch.setattr(runner, "capture_pane", fake_capture_pane)
+
+    result = await runner.run_in_pane(
+        "%1", "printf timeout-marker; sleep 30", timeout=0.01, poll_interval=0.02
+    )
+
+    assert captures == [runner.RUN_POLL_CAPTURE_LINES, runner.RUN_TIMEOUT_CAPTURE_LINES]
+    assert result.stdout == "timeout-marker"
+    assert result.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_returns_empty_output_when_command_never_started(
+    monkeypatch,
+) -> None:
+    markers = iter(("left", "right"))
+    ticks = iter((0.0, 0.0, 0.02, 0.02))
+
+    async def fake_paste_text(target, text):
+        assert target == "%1"
+
+    async def fake_capture_pane(target, lines):
+        assert target == "%1"
+        return "old prompt and echoed wrapper\n"
+
+    async def fake_sleep(delay):
+        assert delay == 0.02
+
+    monkeypatch.setattr(runner.secrets, "token_hex", lambda _: next(markers))
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    monkeypatch.setattr(runner, "asyncio", SimpleNamespace(sleep=fake_sleep))
+    monkeypatch.setattr(runner, "paste_text", fake_paste_text)
+    monkeypatch.setattr(runner, "capture_pane", fake_capture_pane)
+
+    result = await runner.run_in_pane(
+        "%1", "sleep 30", timeout=0.01, poll_interval=0.02
+    )
+
+    assert result.stdout == ""
+    assert result.timed_out is True

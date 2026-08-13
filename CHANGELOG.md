@@ -2,6 +2,10 @@
 
 Notable changes to remote-ssh-mcp are recorded here.
 
+## 0.4.2 - 2026-08-13
+
+- Keep timed-out command output free of internal tmux framing and pane history.
+
 ## 0.4.1 - 2026-08-13
 
 - Separate local SSH preflight checks from connection and tmux lifecycle code.

@@ -192,11 +192,15 @@ async def test_timed_out_run_recovers_shell(tmux_pane):
         label="test",
     )
 
-    result = await SessionManager().run_command(conn, "sleep 30", timeout=0.2)
+    result = await SessionManager().run_command(
+        conn, "printf 'timeout-marker\\n'; sleep 30", timeout=0.2
+    )
     probe = await run_in_pane(pane_id, "printf recovered", timeout=5)
 
     assert result.timed_out is True, (shell, result.stdout)
     assert result.pane_recovered is True, (shell, result.stdout)
+    assert result.stdout == "timeout-marker", (shell, result.stdout)
+    assert "__RSM_" not in result.stdout, (shell, result.stdout)
     assert conn.state == "ready"
     assert probe.stdout == "recovered"
 

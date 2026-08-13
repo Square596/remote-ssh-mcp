@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from .tmux import capture_pane, paste_text, send_keys
 
 RUN_POLL_CAPTURE_LINES = 200
+RUN_TIMEOUT_CAPTURE_LINES = 20_000
 PANE_HISTORY_LIMIT = 1_100_000
 RUN_FINAL_CAPTURE_LINES = PANE_HISTORY_LIMIT
 PANE_RECOVERY_TIMEOUT = 8.0
@@ -64,8 +65,23 @@ async def run_in_pane(
     last_screen = ""
     while True:
         if time.monotonic() > deadline:
+            partial_stdout = _extract_partial_output(last_screen, begin_re, end_re)
+            if partial_stdout is None:
+                try:
+                    full_screen = await capture_pane(
+                        target, lines=RUN_TIMEOUT_CAPTURE_LINES
+                    )
+                except RuntimeError:
+                    partial_stdout = ""
+                else:
+                    history_stdout = _extract_partial_output(
+                        full_screen, begin_re, end_re
+                    )
+                    partial_stdout = (
+                        history_stdout if history_stdout is not None else ""
+                    )
             return RunResult(
-                stdout=last_screen[-2000:],
+                stdout=partial_stdout,
                 exit_code=-1,
                 duration_ms=int((time.monotonic() - start) * 1000),
                 timed_out=True,
@@ -164,3 +180,23 @@ def _extract_output(screen: str, begin_re: re.Pattern[str], end_pos: int) -> str
     if output_start < len(screen) and screen[output_start] == "\n":
         output_start += 1
     return screen[output_start:end_pos].rstrip("\n")
+
+
+def _extract_partial_output(
+    screen: str,
+    begin_re: re.Pattern[str],
+    end_re: re.Pattern[str],
+) -> str | None:
+    """Return attributable output from an incomplete command capture."""
+    begin_matches = list(begin_re.finditer(screen))
+    if not begin_matches:
+        return None
+
+    last_begin = begin_matches[-1]
+    output_start = last_begin.end()
+    if output_start < len(screen) and screen[output_start] == "\n":
+        output_start += 1
+
+    end_match = end_re.search(screen, output_start)
+    output_end = end_match.start() if end_match is not None else len(screen)
+    return screen[output_start:output_end].rstrip("\n")

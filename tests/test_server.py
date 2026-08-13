@@ -187,6 +187,44 @@ async def test_remote_run_accepts_multiline_command(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_remote_run_preserves_clean_partial_output_on_timeout(
+    monkeypatch,
+) -> None:
+    class FakeSessions:
+        def get(self, connection_id):
+            assert connection_id == "conn"
+            return SimpleNamespace(pane_id="%1", lock=asyncio.Lock())
+
+        async def run_command(self, conn, cmd, timeout):
+            assert conn.pane_id == "%1"
+            assert cmd == "printf timeout-marker; sleep 30"
+            assert timeout == 1.0
+            return SimpleNamespace(
+                stdout="timeout-marker",
+                exit_code=-1,
+                duration_ms=1000,
+                timed_out=True,
+                pane_recovered=True,
+            )
+
+    monkeypatch.setattr(server, "sessions", FakeSessions())
+
+    result = await tool_fn(server.remote_run)(
+        connection_id="conn", cmd="printf timeout-marker; sleep 30", timeout=1
+    )
+
+    assert result == {
+        "ok": True,
+        "stdout": "timeout-marker",
+        "exit_code": -1,
+        "duration_ms": 1000,
+        "timed_out": True,
+        "truncated": False,
+        "pane_recovered": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_remote_grep_reports_exact_truncation(monkeypatch) -> None:
     captured: dict[str, str] = {}
 
