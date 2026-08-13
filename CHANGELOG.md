@@ -2,6 +2,12 @@
 
 Notable changes to remote-ssh-mcp are recorded here.
 
+## 0.4.3 - 2026-08-13
+
+- Pin the stable bundled plugin to the matching source tag and tested MCP SDK.
+- Reuse a verified local tool without contacting GitHub on every client start.
+- Document marketplace-managed updates and immutable release publication.
+
 ## 0.4.2 - 2026-08-13
 
 - Keep timed-out command output current and free of internal tmux framing and

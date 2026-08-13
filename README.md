@@ -42,7 +42,7 @@ individual command responses and file reads. See [Limitations](#limitations).
   terminal). Agent forwarding is requested by default via `ssh -A`; pass
   `agent_forwarding=false` to `remote_connect` to disable it.
 - `python3` on the **remote** host (used for verified, atomic file writes).
-- `uv` on your laptop for the bundled auto-updating plugin config. If you
+- `uv` on your laptop for the bundled stable plugin config. If you
   install the MCP server manually, `uv` or `pipx` is fine.
 
 ### As a plugin with bundled skills
@@ -65,11 +65,30 @@ codex plugin add remote-ssh-mcp@Square596
 The plugin directory includes metadata for both clients. Both Claude Code and
 Codex use the bundled `.mcp.json` plus the `remote-ssh` skill.
 
-The bundled MCP config requires `uv` in `PATH`. On client startup it installs
-or upgrades the uv-managed tool from GitHub, then launches `remote-ssh-mcp`.
-That keeps Codex, Claude, Cursor, and other MCP clients on the latest GitHub
-version when they start a new session. Startup depends on GitHub/network
-availability.
+The bundled MCP config requires `uv` in `PATH`. It verifies the installed
+package, source tag, and MCP SDK locally. A matching installation launches
+without contacting GitHub. The first start after installation or a plugin
+update installs the exact release and tested SDK declared by the plugin; if
+that installation cannot be verified, startup fails instead of running a
+different tool version.
+
+Plugin updates are discovered by the client marketplace rather than by the MCP
+server. For Codex, refresh the marketplace and reinstall its snapshot:
+
+```bash
+codex plugin marketplace upgrade Square596
+codex plugin add remote-ssh-mcp@Square596
+```
+
+For Claude Code, update the marketplace and plugin:
+
+```bash
+/plugin marketplace update Square596
+/plugin update remote-ssh-mcp@Square596
+```
+
+Claude Code can also update third-party marketplaces automatically when that
+option is enabled for the marketplace.
 
 An already-running MCP process does not hot-reload after an upgrade. Restart
 the MCP client or begin a new client session to load the updated server. Run
@@ -105,8 +124,8 @@ package from a marketplace. The first JSON block intentionally mirrors
 while plain MCP clients need an equivalent server definition in their own MCP
 config.
 
-If you want auto-updates on each client startup and have `uv` in `PATH`, use
-the auto-updating stdio server directly:
+For the stable `0.4.3` release, use the same pinned launcher as the bundled
+plugin:
 
 ```json
 {
@@ -115,7 +134,7 @@ the auto-updating stdio server directly:
       "command": "sh",
       "args": [
         "-lc",
-        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; rsm_tool_root=\"$(uv tool dir 2>/dev/null)\" && rsm_bin_root=\"$(uv tool dir --bin 2>/dev/null)\" || { echo 'remote-ssh-mcp plugin could not locate the uv tool directories.' >&2; exit 1; }; rsm_python=\"$rsm_tool_root/remote-ssh-mcp/bin/python\"; rsm_bin=\"$rsm_bin_root/remote-ssh-mcp\"; rsm_expected='0.4.3|2.0.0|https://github.com/Square596/remote-ssh-mcp|v0.4.3'; rsm_spec() { \"$rsm_python\" -c 'import importlib.metadata as m,json; d=m.distribution(\"remote-ssh-mcp\"); u=json.loads(d.read_text(\"direct_url.json\") or \"{}\"); print(\"|\".join((d.version,m.version(\"mcp\"),u.get(\"url\",\"\"),u.get(\"vcs_info\",{}).get(\"requested_revision\",\"\"))))' 2>/dev/null; }; if [ -x \"$rsm_bin\" ] && [ \"$(rsm_spec)\" = \"$rsm_expected\" ]; then exec \"$rsm_bin\"; fi; uv tool install --quiet --force --reinstall --with 'mcp==2.0.0' 'git+https://github.com/Square596/remote-ssh-mcp@v0.4.3' >&2 || { echo 'remote-ssh-mcp plugin could not install its pinned release.' >&2; exit 1; }; if [ ! -x \"$rsm_bin\" ] || [ \"$(rsm_spec)\" != \"$rsm_expected\" ]; then echo 'remote-ssh-mcp plugin installed an unexpected package or dependency version.' >&2; exit 1; fi; exec \"$rsm_bin\""
       ],
       "env_vars": ["SSH_AUTH_SOCK"]
     }
@@ -127,21 +146,42 @@ For Codex, `env_vars` forwards the local `SSH_AUTH_SOCK` value into the MCP
 server process so `ssh -A` can use your local ssh-agent. This requires Codex
 itself to be launched from an environment where `SSH_AUTH_SOCK` is set.
 
-You can also install the Python package directly as a stable uv-managed tool:
+For an opt-in development setup that follows the moving default branch, use:
 
-```bash
-uv tool install --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp
+```json
+{
+  "mcpServers": {
+    "remote-ssh": {
+      "command": "sh",
+      "args": [
+        "-lc",
+        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp requires uv in PATH.' >&2; exit 127; }; uv tool install --quiet --upgrade --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+      ],
+      "env_vars": ["SSH_AUTH_SOCK"]
+    }
+  }
+}
 ```
 
-The bundled and recommended install commands select MCP SDK 2.x. The server
-also supports MCP SDK 1.x back to 1.2. To use the older SDK line, install with:
+This development configuration resolves GitHub and dependencies on every
+client startup and may pick up unreleased changes.
+
+You can also install the stable Python package directly as a uv-managed tool:
 
 ```bash
-uv tool install --reinstall --with 'mcp>=1.2,<2' git+https://github.com/Square596/remote-ssh-mcp
+uv tool install --with 'mcp==2.0.0' 'git+https://github.com/Square596/remote-ssh-mcp@v0.4.3'
 ```
 
-Do not combine that fallback with the bundled auto-updating configuration,
-which restores the recommended SDK 2.x constraint on startup.
+The bundled and recommended stable install selects the MCP SDK version tested
+for the release. The server also supports MCP SDK 1.x back to 1.2. To use the
+older SDK line, install it manually from the same immutable source tag:
+
+```bash
+uv tool install --reinstall --with 'mcp>=1.2,<2' 'git+https://github.com/Square596/remote-ssh-mcp@v0.4.3'
+```
+
+Do not combine that fallback with the bundled plugin configuration, which
+restores the release's tested SDK on startup.
 
 Then add the installed command to your MCP client config:
 
@@ -161,10 +201,12 @@ For Claude Code CLI:
 claude mcp add remote-ssh remote-ssh-mcp
 ```
 
-Installed tools are stable until upgraded. To update the installed command:
+Installed tools remain on their selected tag. To move a manual installation to
+a newer release, reinstall it with that release's tag and documented SDK pin:
 
 ```bash
-uv tool upgrade remote-ssh-mcp
+uv tool install --force --reinstall --with 'mcp==2.0.0' \
+  'git+https://github.com/Square596/remote-ssh-mcp@v0.4.3'
 ```
 
 ## Usage
