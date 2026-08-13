@@ -1,6 +1,6 @@
 {
   "name": "remote-ssh-mcp",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Let MCP-capable coding agents work on remote SSH hosts through persistent, watchable tmux sessions.",
   "author": { "name": "Square596", "url": "https://github.com/Square596" },
   "homepage": "https://github.com/Square596/remote-ssh-mcp",

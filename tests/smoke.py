@@ -185,6 +185,21 @@ class SmokeHarness:
             f"multiline output mismatch: {result!r}",
         )
 
+        step("remote_run clean timeout output and pane recovery")
+        result = await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd="printf 'timeout-marker\\n'; sleep 30",
+            timeout=1,
+        )
+        self.require(result.get("timed_out") is True, repr(result))
+        self.require(result.get("pane_recovered") is True, repr(result))
+        self.require(result.get("stdout") == "timeout-marker", repr(result))
+        recovered = await self.require_ok(
+            "remote_run", connection_id=main_id, cmd="printf recovered"
+        )
+        self.require(recovered.get("stdout") == "recovered", repr(recovered))
+
         step("remote_write and remote_read small UTF-8 text")
         text_path = remote_path(self.primary_dir, "text.txt")
         text = "Hello, remote!\nLine 2 with ✨ unicode\nLine 3\n"
