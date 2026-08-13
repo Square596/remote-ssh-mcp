@@ -55,9 +55,14 @@ how to use it. In Claude Code, install it with:
 /plugin install remote-ssh-mcp@Square596
 ```
 
-The same plugin directory includes Codex metadata
-(`plugins/remote-ssh-mcp/.codex-plugin/plugin.json`) and a repo-local Codex
-marketplace entry (`.agents/plugins/marketplace.json`). Both Claude Code and
+In Codex, install the same plugin with:
+
+```bash
+codex plugin marketplace add Square596/remote-ssh-mcp
+codex plugin add remote-ssh-mcp@Square596
+```
+
+The plugin directory includes metadata for both clients. Both Claude Code and
 Codex use the bundled `.mcp.json` plus the `remote-ssh` skill.
 
 The bundled MCP config requires `uv` in `PATH`. On client startup it installs
@@ -65,6 +70,11 @@ or upgrades the uv-managed tool from GitHub, then launches `remote-ssh-mcp`.
 That keeps Codex, Claude, Cursor, and other MCP clients on the latest GitHub
 version when they start a new session. Startup depends on GitHub/network
 availability.
+
+An already-running MCP process does not hot-reload after an upgrade. Restart
+the MCP client or begin a new client session to load the updated server. Run
+`remote-ssh-mcp --version` to see which version a newly launched process will
+use.
 
 ### Repository plugin layout
 

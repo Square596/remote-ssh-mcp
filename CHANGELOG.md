@@ -2,6 +2,13 @@
 
 Notable changes to remote-ssh-mcp are recorded here.
 
+## 0.4.1 - 2026-08-13
+
+- Separate local SSH preflight checks from connection and tmux lifecycle code.
+- Make tool descriptions concise and semantic, and add a CLI version flag.
+- Make operation recovery robust to unstructured exception diagnostics.
+- Exercise public MCP tools in remote smoke tests with verified cleanup.
+
 ## 0.4.0 - 2026-08-13
 
 - Add stable object-shaped response schemas and accurate tool annotations on
