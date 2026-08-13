@@ -352,8 +352,11 @@ async def test_timeout_refreshes_output_after_the_last_poll(monkeypatch) -> None
     assert result.timed_out is True
 
 
+@pytest.mark.parametrize("deadline_capture", [None, "marker evicted by new output"])
 @pytest.mark.asyncio
-async def test_timeout_falls_back_to_last_poll_when_refresh_fails(monkeypatch) -> None:
+async def test_timeout_falls_back_to_last_attributable_poll(
+    monkeypatch, deadline_capture: str | None
+) -> None:
     markers = iter(("left", "right"))
     ticks = iter((0.0, 0.0, 0.02, 0.02))
     captures = 0
@@ -368,7 +371,9 @@ async def test_timeout_falls_back_to_last_poll_when_refresh_fails(monkeypatch) -
         captures += 1
         if captures == 1:
             return recent
-        raise RuntimeError("tmux capture failed")
+        if deadline_capture is None:
+            raise RuntimeError("tmux capture failed")
+        return deadline_capture
 
     async def fake_sleep(delay):
         assert delay == 0.02

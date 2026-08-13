@@ -76,6 +76,8 @@ async def run_in_pane(
                 timeout_screen = last_screen
             partial_stdout = _extract_partial_output(timeout_screen, begin_re, end_re)
             if partial_stdout is None:
+                partial_stdout = _extract_partial_output(last_screen, begin_re, end_re)
+            if partial_stdout is None:
                 partial_stdout = ""
             return RunResult(
                 stdout=partial_stdout,
