@@ -20,7 +20,7 @@ def _emit_limited_process(command, limit, success_codes):
             stderr=errors,
         )
         lines = []
-        overflow = False
+        terminated_for_limit = False
         try:
             while True:
                 line = process.stdout.readline()
@@ -28,9 +28,9 @@ def _emit_limited_process(command, limit, success_codes):
                     break
                 lines.append(line)
                 if len(lines) >= limit:
-                    overflow = True
                     if process.poll() is None:
                         process.terminate()
+                        terminated_for_limit = True
                     break
             try:
                 return_code = process.wait(timeout=2)
@@ -44,7 +44,7 @@ def _emit_limited_process(command, limit, success_codes):
             raise
 
         sys.stdout.buffer.writelines(lines)
-        if overflow or return_code in success_codes:
+        if terminated_for_limit or return_code in success_codes:
             return 0
 
         errors.seek(0)

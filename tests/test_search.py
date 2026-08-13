@@ -44,6 +44,38 @@ def test_grep_fallback_limits_output(monkeypatch, tmp_path, capfd) -> None:
     assert len(capfd.readouterr().out.splitlines()) == 2
 
 
+def test_limited_process_preserves_completed_failure(monkeypatch, capfd) -> None:
+    class FailedProcess:
+        def __init__(self, *, stdout, errors) -> None:
+            self.stdout = stdout
+            errors.write(b"permission denied\n")
+
+        def poll(self) -> int:
+            return 2
+
+        def wait(self, timeout=None) -> int:
+            return 2
+
+        def terminate(self) -> None:
+            raise AssertionError("completed process must not be terminated")
+
+        def kill(self) -> None:
+            raise AssertionError("completed process must not be killed")
+
+    def fake_popen(command, *, stdin, stdout, stderr):
+        del command, stdin, stdout
+        import io
+
+        return FailedProcess(stdout=io.BytesIO(b"first\nsecond\n"), errors=stderr)
+
+    monkeypatch.setattr(_search_runner.subprocess, "Popen", fake_popen)
+
+    result = _search_runner._emit_limited_process(["search"], 2, {0, 1})
+
+    assert result == 2
+    assert capfd.readouterr().out == "first\nsecond\npermission denied\n"
+
+
 def test_glob_is_sorted_and_bounded(tmp_path, capfd) -> None:
     for name in ("c.py", "a.py", "b.py", "ignored.txt"):
         (tmp_path / name).write_text(name, encoding="utf-8")
