@@ -19,6 +19,8 @@ jobs:
             requirement: mcp==1.2.0
           - name: latest-v1
             requirement: mcp>=1.2,<2
+          - name: bundled-v2
+            requirement: mcp==2.0.0
           - name: latest-v2
             requirement: mcp>=2,<3
     steps:

@@ -30,3 +30,10 @@ def test_package_lock_and_plugin_versions_match() -> None:
     for manifest_path in MANIFESTS:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         assert manifest["version"] == expected
+
+    plugin_config = json.loads(
+        (ROOT / "plugins/remote-ssh-mcp/.mcp.json").read_text(encoding="utf-8")
+    )
+    command = plugin_config["mcpServers"]["remote-ssh"]["args"][-1]
+    assert f"remote-ssh-mcp@v{expected}" in command
+    assert f"rsm_expected='{expected}|" in command
