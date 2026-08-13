@@ -51,6 +51,9 @@ async def run_in_pane(
     begin_literal = f"__RSM_BEGIN_{marker}__"
     end_re = re.compile(rf"^__RSM_END_{re.escape(marker)}_(\d+)__$", re.MULTILINE)
     cwd_re = re.compile(rf"^__RSM_CWD_{re.escape(marker)}__ (.*)$", re.MULTILINE)
+    trace_re = re.compile(
+        rf"_{{2,}}RSM_XTRACE_{re.escape(marker_left)}__[^\n]*(?:\n|$)"
+    )
     # The remote PTY can render the command echo and first output on the same
     # visual line. The echoed wrapper keeps the random halves separated while
     # executed output joins them, so only the latter contains the full marker.
@@ -74,9 +77,13 @@ async def run_in_pane(
                 )
             except RuntimeError:
                 timeout_screen = last_screen
-            partial_stdout = _extract_partial_output(timeout_screen, begin_re, end_re)
+            partial_stdout = _extract_partial_output(
+                timeout_screen, begin_re, end_re, trace_re
+            )
             if partial_stdout is None:
-                partial_stdout = _extract_partial_output(last_screen, begin_re, end_re)
+                partial_stdout = _extract_partial_output(
+                    last_screen, begin_re, end_re, trace_re
+                )
             if partial_stdout is None:
                 partial_stdout = ""
             return RunResult(
@@ -102,7 +109,7 @@ async def run_in_pane(
                     "command output exceeded available tmux history before completion"
                 )
             exit_code = int(m.group(1))
-            stdout = _extract_output(screen, begin_re, m.start())
+            stdout = _extract_output(screen, begin_re, m.start(), trace_re)
             return RunResult(
                 stdout=stdout,
                 exit_code=exit_code,
@@ -130,27 +137,29 @@ def _wrap_command(
     if not normalized_cmd.strip():
         raise ValueError("remote command must not be empty")
 
-    # Shell execution tracing is pane-wide state. Suspend inherited tracing
-    # around the framed command so PS4/xtrace diagnostics cannot become tool
-    # output, then restore the setting after all protocol markers are emitted.
-    # The randomized variable names avoid collisions with user shell state.
-    xtrace_var = f"__rsm_xtrace_{marker}"
+    # Mark shell trace diagnostics so output extraction can remove them without
+    # changing the command's xtrace state. Randomized variable names avoid
+    # collisions with user shell state.
     exit_var = f"__rsm_exit_{marker}"
+    ps4_before_var = f"__rsm_ps4_before_{marker}"
+    ps4_after_var = f"__rsm_ps4_after_{marker}"
+    trace_prefix = f"__RSM_XTRACE_{marker}__ "
 
     return (
-        f"case $- in *x*) {xtrace_var}=1 ;; *) {xtrace_var}=0 ;; esac; "
-        "set +x; "
+        f'{ps4_before_var}="$PS4"; '
+        f"PS4={shlex.quote(trace_prefix)}; "
         f"printf '%s%s%s%s\\n' '__RSM_BEGIN_' {shlex.quote(marker)} "
         f"{shlex.quote(marker_right)} '__'; "
         f"eval {shlex.quote(normalized_cmd)}; "
         f"{exit_var}=$?; "
+        f'{ps4_after_var}="$PS4"; '
         f"printf '\\n%s%s%s_%s%s\\n' '__RSM_END_' {shlex.quote(marker)} "
         f'{shlex.quote(marker_right)} "${{{exit_var}}}" "__"; '
         f"printf '%s%s%s%s %s\\n' '__RSM_CWD_' {shlex.quote(marker)} "
         f"{shlex.quote(marker_right)} '__' \"$PWD\"; "
-        f'if [ "${{{xtrace_var}}}" = 1 ]; then '
-        f"unset {xtrace_var} {exit_var}; set -x; "
-        f"else unset {xtrace_var} {exit_var}; fi"
+        f'if [ "${{{ps4_after_var}}}" = {shlex.quote(trace_prefix)} ]; then '
+        f'PS4="${{{ps4_before_var}}}"; else PS4="${{{ps4_after_var}}}"; fi; '
+        f"unset {exit_var} {ps4_before_var} {ps4_after_var}"
     )
 
 
@@ -176,7 +185,12 @@ async def recover_pane(target: str, timeout: float = PANE_RECOVERY_TIMEOUT) -> b
     return not probe.timed_out and probe.exit_code == 0
 
 
-def _extract_output(screen: str, begin_re: re.Pattern[str], end_pos: int) -> str:
+def _extract_output(
+    screen: str,
+    begin_re: re.Pattern[str],
+    end_pos: int,
+    trace_re: re.Pattern[str] | None = None,
+) -> str:
     """Return content between the LAST BEGIN sentinel before end_pos and end_pos itself.
 
     The caller in run_in_pane guarantees BEGIN is present before invoking us,
@@ -191,13 +205,17 @@ def _extract_output(screen: str, begin_re: re.Pattern[str], end_pos: int) -> str
     output_start = last_begin.end()
     if output_start < len(screen) and screen[output_start] == "\n":
         output_start += 1
-    return screen[output_start:end_pos].rstrip("\n")
+    output = screen[output_start:end_pos]
+    if trace_re is not None:
+        output = trace_re.sub("", output)
+    return output.rstrip("\n")
 
 
 def _extract_partial_output(
     screen: str,
     begin_re: re.Pattern[str],
     end_re: re.Pattern[str],
+    trace_re: re.Pattern[str] | None = None,
 ) -> str | None:
     """Return attributable output from an incomplete command capture."""
     begin_matches = list(begin_re.finditer(screen))
@@ -211,4 +229,7 @@ def _extract_partial_output(
 
     end_match = end_re.search(screen, output_start)
     output_end = end_match.start() if end_match is not None else len(screen)
-    return screen[output_start:output_end].rstrip("\n")
+    output = screen[output_start:output_end]
+    if trace_re is not None:
+        output = trace_re.sub("", output)
+    return output.rstrip("\n")
