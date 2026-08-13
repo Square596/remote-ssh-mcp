@@ -199,6 +199,35 @@ def test_wrap_command_framing_cannot_be_clobbered_by_user_variables() -> None:
     assert "__RSM_CWD_leftright__" in proc.stdout
 
 
+@pytest.mark.parametrize("shell", ["bash", "zsh"])
+def test_wrap_command_suspends_and_restores_inherited_xtrace(shell: str) -> None:
+    shell_path = shutil.which(shell)
+    if shell_path is None:
+        pytest.skip(f"{shell} is required")
+
+    marker = "abc123"
+    wrapped = _wrap_command(marker, "printf clean")
+    proc = subprocess.run(
+        [
+            shell_path,
+            "-fc",
+            (
+                f"set -x; {wrapped}; "
+                "case $- in *x*) set +x; printf TRACE_RESTORED ;; esac"
+            ),
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    begin_re = re.compile(rf"__RSM_BEGIN_{marker}__")
+    end_pos = proc.stdout.index(f"__RSM_END_{marker}_0__")
+
+    assert _extract_output(proc.stdout, begin_re, end_pos) == "clean"
+    assert "TRACE_RESTORED" in proc.stdout
+
+
 @pytest.mark.asyncio
 async def test_run_rejects_non_positive_deadlines_before_paste(monkeypatch) -> None:
     async def unexpected_paste(*args, **kwargs):
@@ -283,6 +312,79 @@ async def test_timeout_retries_history_without_leaking_unattributed_output(
 
     assert captures == [runner.RUN_POLL_CAPTURE_LINES, runner.RUN_TIMEOUT_CAPTURE_LINES]
     assert result.stdout == "timeout-marker"
+    assert result.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_refreshes_output_after_the_last_poll(monkeypatch) -> None:
+    markers = iter(("left", "right"))
+    ticks = iter((0.0, 0.0, 0.02, 0.02))
+    captures: list[int] = []
+    recent = "__RSM_BEGIN_leftright__\nearly\n"
+    at_deadline = "__RSM_BEGIN_leftright__\nearly\nlate\n"
+
+    async def fake_paste_text(target, text):
+        assert target == "%1"
+
+    async def fake_capture_pane(target, lines):
+        assert target == "%1"
+        captures.append(lines)
+        return recent if len(captures) == 1 else at_deadline
+
+    async def fake_sleep(delay):
+        assert delay == 0.02
+
+    monkeypatch.setattr(runner.secrets, "token_hex", lambda _: next(markers))
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    monkeypatch.setattr(runner, "asyncio", SimpleNamespace(sleep=fake_sleep))
+    monkeypatch.setattr(runner, "paste_text", fake_paste_text)
+    monkeypatch.setattr(runner, "capture_pane", fake_capture_pane)
+
+    result = await runner.run_in_pane(
+        "%1",
+        "printf early; sleep 1; printf late; sleep 30",
+        timeout=0.01,
+        poll_interval=0.02,
+    )
+
+    assert captures == [runner.RUN_POLL_CAPTURE_LINES, runner.RUN_TIMEOUT_CAPTURE_LINES]
+    assert result.stdout == "early\nlate"
+    assert result.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_timeout_falls_back_to_last_poll_when_refresh_fails(monkeypatch) -> None:
+    markers = iter(("left", "right"))
+    ticks = iter((0.0, 0.0, 0.02, 0.02))
+    captures = 0
+    recent = "__RSM_BEGIN_leftright__\nattributable\n"
+
+    async def fake_paste_text(target, text):
+        assert target == "%1"
+
+    async def fake_capture_pane(target, lines):
+        nonlocal captures
+        assert target == "%1"
+        captures += 1
+        if captures == 1:
+            return recent
+        raise RuntimeError("tmux capture failed")
+
+    async def fake_sleep(delay):
+        assert delay == 0.02
+
+    monkeypatch.setattr(runner.secrets, "token_hex", lambda _: next(markers))
+    monkeypatch.setattr(runner, "time", SimpleNamespace(monotonic=lambda: next(ticks)))
+    monkeypatch.setattr(runner, "asyncio", SimpleNamespace(sleep=fake_sleep))
+    monkeypatch.setattr(runner, "paste_text", fake_paste_text)
+    monkeypatch.setattr(runner, "capture_pane", fake_capture_pane)
+
+    result = await runner.run_in_pane(
+        "%1", "printf attributable; sleep 30", timeout=0.01, poll_interval=0.02
+    )
+
+    assert captures == 2
+    assert result.stdout == "attributable"
     assert result.timed_out is True
 
 

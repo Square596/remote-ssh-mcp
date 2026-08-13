@@ -65,21 +65,18 @@ async def run_in_pane(
     last_screen = ""
     while True:
         if time.monotonic() > deadline:
-            partial_stdout = _extract_partial_output(last_screen, begin_re, end_re)
+            # Refresh once at the deadline so output produced since the last
+            # poll is not lost. If tmux itself fails, the last successful poll
+            # remains the safest attributable fallback.
+            try:
+                timeout_screen = await capture_pane(
+                    target, lines=RUN_TIMEOUT_CAPTURE_LINES
+                )
+            except RuntimeError:
+                timeout_screen = last_screen
+            partial_stdout = _extract_partial_output(timeout_screen, begin_re, end_re)
             if partial_stdout is None:
-                try:
-                    full_screen = await capture_pane(
-                        target, lines=RUN_TIMEOUT_CAPTURE_LINES
-                    )
-                except RuntimeError:
-                    partial_stdout = ""
-                else:
-                    history_stdout = _extract_partial_output(
-                        full_screen, begin_re, end_re
-                    )
-                    partial_stdout = (
-                        history_stdout if history_stdout is not None else ""
-                    )
+                partial_stdout = ""
             return RunResult(
                 stdout=partial_stdout,
                 exit_code=-1,
@@ -131,14 +128,27 @@ def _wrap_command(
     if not normalized_cmd.strip():
         raise ValueError("remote command must not be empty")
 
+    # Shell execution tracing is pane-wide state. Suspend inherited tracing
+    # around the framed command so PS4/xtrace diagnostics cannot become tool
+    # output, then restore the setting after all protocol markers are emitted.
+    # The randomized variable names avoid collisions with user shell state.
+    xtrace_var = f"__rsm_xtrace_{marker}"
+    exit_var = f"__rsm_exit_{marker}"
+
     return (
+        f"case $- in *x*) {xtrace_var}=1 ;; *) {xtrace_var}=0 ;; esac; "
+        "set +x; "
         f"printf '%s%s%s%s\\n' '__RSM_BEGIN_' {shlex.quote(marker)} "
         f"{shlex.quote(marker_right)} '__'; "
         f"eval {shlex.quote(normalized_cmd)}; "
+        f"{exit_var}=$?; "
         f"printf '\\n%s%s%s_%s%s\\n' '__RSM_END_' {shlex.quote(marker)} "
-        f'{shlex.quote(marker_right)} "$?" "__"; '
+        f'{shlex.quote(marker_right)} "${{{exit_var}}}" "__"; '
         f"printf '%s%s%s%s %s\\n' '__RSM_CWD_' {shlex.quote(marker)} "
-        f"{shlex.quote(marker_right)} '__' \"$PWD\""
+        f"{shlex.quote(marker_right)} '__' \"$PWD\"; "
+        f'if [ "${{{xtrace_var}}}" = 1 ]; then '
+        f"unset {xtrace_var} {exit_var}; set -x; "
+        f"else unset {xtrace_var} {exit_var}; fi"
     )
 
 
