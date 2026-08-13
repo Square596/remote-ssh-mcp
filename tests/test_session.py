@@ -155,6 +155,30 @@ async def test_recovering_operation_marks_failed_pane_unresponsive(monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_recovering_operation_ignores_non_mapping_error_details(
+    monkeypatch,
+) -> None:
+    sm = SessionManager()
+    conn = make_connection()
+
+    class ErrorWithDetails(RuntimeError):
+        details = "not structured diagnostics"
+
+    async def fake_recover(pane_id):
+        assert pane_id == "%1"
+        return True
+
+    monkeypatch.setattr("remote_ssh_mcp.session.recover_pane", fake_recover)
+
+    with pytest.raises(ErrorWithDetails, match="write failed"):
+        async with sm.operation(conn, "write", recover_on_failure=True):
+            raise ErrorWithDetails("write failed")
+
+    assert conn.state == "ready"
+    assert conn.last_error == "write failed: write failed"
+
+
+@pytest.mark.asyncio
 async def test_run_timeout_recovers_pane_and_updates_status(monkeypatch) -> None:
     sm = SessionManager()
     conn = make_connection(cwd="/before")

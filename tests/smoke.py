@@ -1,29 +1,43 @@
-"""End-to-end smoke test that exercises every module against a real SSH host.
+"""End-to-end smoke test for the public MCP tools on a real SSH host.
 
 Run with:
-    uv run python tests/smoke.py <host> \
+    uv run --frozen python tests/smoke.py <host> \
         --work-dir <writable-existing-remote-dir> \
         --second-dir <existing-remote-dir> \
         --missing-dir <nonexistent-remote-dir>
 
-`<host>` must be reachable via SSH non-interactively (BatchMode=yes) — i.e.
-configured in your ~/.ssh/config with key-based auth. Agent forwarding is used
-by default, and a usable forwarded agent is recommended for remote-side private
-SSH/Git operations. Remote host and directory choices are provided by
-arguments, not hardcoded in this test.
+The host must be reachable non-interactively through its SSH config alias.
+Every run uses unique subdirectories and verifies their removal before exit.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import posixpath
+import secrets
 import shlex
 import sys
+from importlib.metadata import version as distribution_version
+from pathlib import Path
+from typing import Any
 
-from remote_ssh_mcp.files import edit_remote_file, read_remote_file, write_remote_file
-from remote_ssh_mcp.runner import run_in_pane
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10
+    import tomli as tomllib
+
+from remote_ssh_mcp import server
 from remote_ssh_mcp.session import SessionManager
+
+ROOT = Path(__file__).parents[1]
+LARGE_WRITE_BYTES = 5_000_000
+READ_CHUNK_BYTES = 500_000
+
+
+class SmokeFailure(RuntimeError):
+    pass
 
 
 def step(label: str) -> None:
@@ -34,275 +48,440 @@ def remote_path(root: str, name: str) -> str:
     return posixpath.join(root.rstrip("/") or "/", name)
 
 
-async def main(host: str, work_dir: str, second_dir: str, missing_dir: str) -> int:
-    sm = SessionManager()
-    failures: list[str] = []
+def project_version() -> str:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    return project["project"]["version"]
 
-    step(f"connect to {host}")
-    conn = await sm.connect(host=host, project_path=work_dir, label="smoke-test")
-    print(
-        f"connection_id={conn.connection_id} pane={conn.pane_id} attach={conn.session_name}"
-    )
 
-    step("remote_run: hostname && pwd")
-    r = await run_in_pane(conn.pane_id, "hostname && pwd")
-    print(f"rc={r.exit_code} duration={r.duration_ms}ms")
-    print(r.stdout)
-    if r.exit_code != 0 or not r.stdout.strip():
-        failures.append(f"hostname/pwd failed: rc={r.exit_code}")
+class SmokeHarness:
+    def __init__(
+        self,
+        host: str,
+        work_dir: str,
+        second_dir: str,
+        missing_dir: str,
+    ) -> None:
+        self.host = host
+        self.work_dir = work_dir.rstrip("/") or "/"
+        self.second_dir = second_dir.rstrip("/") or "/"
+        self.run_id = f"rsm-smoke-{secrets.token_hex(6)}"
+        self.primary_dir = remote_path(self.work_dir, f"{self.run_id}-main")
+        self.secondary_dir = remote_path(self.second_dir, f"{self.run_id}-second")
+        self.missing_dir = remote_path(missing_dir, self.run_id)
+        self.connection_ids: list[str] = []
+        self.cleanup_failures: list[str] = []
+        self._validate_cleanup_paths()
 
-    step("remote_run: failing command")
-    r = await run_in_pane(conn.pane_id, "false")
-    print(f"rc={r.exit_code} (expect 1)")
-    if r.exit_code != 1:
-        failures.append(f"`false` should yield rc=1, got {r.exit_code}")
+    def _validate_cleanup_paths(self) -> None:
+        for parent, path in (
+            (self.work_dir, self.primary_dir),
+            (self.second_dir, self.secondary_dir),
+        ):
+            if posixpath.dirname(path) != parent or not posixpath.basename(
+                path
+            ).startswith("rsm-smoke-"):
+                raise ValueError(f"unsafe smoke cleanup path: {path!r}")
 
-    step("remote_run: shell state persists (cd + export)")
-    await run_in_pane(conn.pane_id, f"cd {shlex.quote(work_dir)} && export RSM_TEST=42")
-    r = await run_in_pane(conn.pane_id, 'pwd; echo "RSM_TEST=$RSM_TEST"')
-    print(r.stdout)
-    if "RSM_TEST=42" not in r.stdout or work_dir not in r.stdout:
-        failures.append("shell state did not persist across calls")
+    @staticmethod
+    def _tool(name: str):
+        registered = getattr(server, name)
+        return getattr(registered, "fn", registered)
 
-    step("remote_run: multi-line command and heredoc")
-    r = await run_in_pane(
-        conn.pane_id,
-        "for i in 1 2 3 4 5; do\n"
-        "  echo line$i\n"
-        "done\n"
-        "cat <<'RSM_HEREDOC'\n"
-        "literal:$HOME\n"
-        "RSM_HEREDOC\n",
-    )
-    print(r.stdout)
-    expected_lines = [f"line{i}" for i in range(1, 6)] + ["literal:$HOME"]
-    if r.stdout.strip().splitlines() != expected_lines:
-        failures.append(f"multi-line command mismatch: {r.stdout!r}")
+    async def call(self, name: str, **arguments: Any) -> dict[str, Any]:
+        result = await self._tool(name)(**arguments)
+        if not isinstance(result, dict):
+            raise SmokeFailure(f"{name} returned a non-object result: {result!r}")
+        return result
 
-    step("remote_run: command with embedded special chars")
-    r = await run_in_pane(conn.pane_id, """echo "hello 'world' \\$HOME=$HOME" """)
-    print(r.stdout)
-    if "hello" not in r.stdout or "$HOME=" not in r.stdout:
-        failures.append("special-char echo failed")
+    async def require_ok(self, name: str, **arguments: Any) -> dict[str, Any]:
+        result = await self.call(name, **arguments)
+        if result.get("ok") is not True:
+            raise SmokeFailure(f"{name} failed: {result!r}")
+        return result
 
-    step("remote_write + remote_read roundtrip (small text)")
-    test_path = remote_path(work_dir, "rsm_smoke_test.txt")
-    payload = b"Hello, remote!\nLine 2 with \xe2\x9c\xa8 unicode\nLine 3\n"
-    await write_remote_file(conn.pane_id, test_path, payload)
-    data, total = await read_remote_file(conn.pane_id, test_path)
-    print(
-        f"wrote {len(payload)} bytes, read {len(data)} bytes, total_size reported={total}"
-    )
-    if data != payload:
-        failures.append(f"roundtrip mismatch:\n  wrote: {payload!r}\n  read:  {data!r}")
+    @staticmethod
+    def require(condition: bool, message: str) -> None:
+        if not condition:
+            raise SmokeFailure(message)
 
-    step("remote_write: binary roundtrip (random 1 MB)")
-    import os as _os
-
-    blob = _os.urandom(1_000_000)
-    medium_path = remote_path(work_dir, "rsm_smoke_blob.bin")
-    await write_remote_file(conn.pane_id, medium_path, blob)
-    data, total = await read_remote_file(conn.pane_id, medium_path)
-    if data != blob:
-        failures.append(
-            f"binary blob roundtrip mismatch (got {len(data)}/{len(blob)} bytes)"
+    async def connect(self, project_path: str, label: str) -> dict[str, Any]:
+        result = await self.require_ok(
+            "remote_connect",
+            host=self.host,
+            project_path=project_path,
+            label=label,
         )
-    else:
-        print(f"binary blob roundtrip OK ({len(blob)} bytes)")
+        connection_id = result.get("connection_id")
+        if not isinstance(connection_id, str):
+            raise SmokeFailure(f"remote_connect omitted connection_id: {result!r}")
+        self.connection_ids.append(connection_id)
+        return result
 
-    step("remote_write: verified large transfer (random 5 MB)")
-    import hashlib as _hashlib
-
-    large_blob = _os.urandom(5_000_000)
-    large_path = remote_path(work_dir, "rsm_smoke_large_blob.bin")
-    await write_remote_file(conn.pane_id, large_path, large_blob)
-    expected_sha256 = _hashlib.sha256(large_blob).hexdigest()
-    verify_code = (
-        "import hashlib; "
-        f"p={large_path!r}; "
-        "print(hashlib.sha256(open(p,'rb').read()).hexdigest())"
-    )
-    verified = await run_in_pane(
-        conn.pane_id,
-        f"python3 -c {shlex.quote(verify_code)}",
-        timeout=120,
-    )
-    if verified.exit_code != 0 or verified.stdout.strip() != expected_sha256:
-        failures.append(
-            "large write verification failed: "
-            f"rc={verified.exit_code} output={verified.stdout!r}"
+    async def run(self) -> None:
+        installed_version = distribution_version("remote-ssh-mcp")
+        expected_version = project_version()
+        self.require(
+            installed_version == expected_version,
+            f"checkout version {expected_version} loaded package {installed_version}",
         )
-    else:
-        print(f"large write OK ({len(large_blob)} bytes, sha256 verified)")
+        print(f"testing remote-ssh-mcp {installed_version}")
 
-    step("remote_edit: unique replacement")
-    await write_remote_file(conn.pane_id, test_path, b"alpha\nbravo\ncharlie\n")
-    res = await edit_remote_file(conn.pane_id, test_path, old="bravo", new="DELTA")
-    print(f"replaced={res.occurrences_replaced} bytes_after={res.bytes_after}")
-    data, _ = await read_remote_file(conn.pane_id, test_path)
-    if data != b"alpha\nDELTA\ncharlie\n":
-        failures.append(f"edit produced wrong content: {data!r}")
-
-    step("remote_edit: non-unique without replace_all should error")
-    await write_remote_file(conn.pane_id, test_path, b"x x x\n")
-    try:
-        await edit_remote_file(conn.pane_id, test_path, old="x", new="Y")
-    except Exception as e:
-        print(f"got expected error: {e!r}")
-    else:
-        failures.append("non-unique edit should have raised but didn't")
-
-    step("remote_edit: replace_all")
-    res = await edit_remote_file(
-        conn.pane_id, test_path, old="x", new="Y", replace_all=True
-    )
-    data, _ = await read_remote_file(conn.pane_id, test_path)
-    if data != b"Y Y Y\n" or res.occurrences_replaced != 3:
-        failures.append(
-            f"replace_all produced wrong content: {data!r} replaced={res.occurrences_replaced}"
+        step("connect and create isolated work directories")
+        main = await self.connect(self.work_dir, f"{self.run_id}-main")
+        main_id = main["connection_id"]
+        self.require(main.get("cwd_warning") is None, repr(main.get("cwd_warning")))
+        created = await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd=(
+                "mkdir -p -- "
+                f"{shlex.quote(self.primary_dir)} "
+                f"{shlex.quote(self.secondary_dir)}"
+            ),
         )
-    else:
-        print(f"replace_all OK ({res.occurrences_replaced} occurrences)")
+        self.require(created["exit_code"] == 0, f"mkdir failed: {created!r}")
 
-    step("remote_run: long output (1000 lines)")
-    r = await run_in_pane(conn.pane_id, "for i in $(seq 1 1000); do echo line$i; done")
-    lines = r.stdout.strip().splitlines()
-    if len(lines) != 1000 or lines[0] != "line1" or lines[-1] != "line1000":
-        failures.append(f"long output: got {len(lines)} lines (expected 1000)")
-    else:
-        print(f"long output OK ({len(lines)} lines, duration={r.duration_ms}ms)")
-
-    step(f"remote_grep: search for unique pattern in {work_dir}")
-    grep_a_path = remote_path(work_dir, "rsm_grep_a.txt")
-    grep_b_path = remote_path(work_dir, "rsm_grep_b.txt")
-    await write_remote_file(conn.pane_id, grep_a_path, b"foo\nNEEDLE_42\nbar\n")
-    await write_remote_file(conn.pane_id, grep_b_path, b"baz\nqux\n")
-    quoted_work_dir = shlex.quote(work_dir)
-    r = await run_in_pane(
-        conn.pane_id,
-        "if command -v rg >/dev/null 2>&1; then "
-        f"rg -n NEEDLE_42 {quoted_work_dir} 2>/dev/null || true; "
-        f"else grep -rn NEEDLE_42 {quoted_work_dir} 2>/dev/null || true; fi",
-    )
-    if "NEEDLE_42" not in r.stdout or "rsm_grep_a.txt" not in r.stdout:
-        failures.append(f"grep didn't find NEEDLE_42 in expected file: {r.stdout!r}")
-    else:
-        print("grep OK")
-
-    step(f"remote_glob: find *.txt in {work_dir}")
-    r = await run_in_pane(
-        conn.pane_id,
-        f"find {quoted_work_dir} -type f -name 'rsm_grep_*.txt' 2>/dev/null",
-    )
-    files_found = [ln for ln in r.stdout.splitlines() if ln.strip()]
-    if not any("rsm_grep_a.txt" in f for f in files_found) or not any(
-        "rsm_grep_b.txt" in f for f in files_found
-    ):
-        failures.append(f"glob missing expected files: {files_found}")
-    else:
-        print(f"glob OK ({len(files_found)} files)")
-
-    step("multi-connection isolation (parent + simulated subagent)")
-    sub = await sm.connect(host=host, project_path=second_dir, label="smoke-sub")
-    print(f"sub connection_id={sub.connection_id} pane={sub.pane_id}")
-    await run_in_pane(sub.pane_id, "export RSM_SUB_VAR=subvalue")
-    parent_check = await run_in_pane(conn.pane_id, "echo P=$RSM_SUB_VAR/cwd=$(pwd)")
-    sub_check = await run_in_pane(sub.pane_id, "echo S=$RSM_SUB_VAR/cwd=$(pwd)")
-    if (
-        "RSM_SUB_VAR=subvalue"
-        not in (await run_in_pane(sub.pane_id, "echo RSM_SUB_VAR=$RSM_SUB_VAR")).stdout
-    ):
-        failures.append("subagent connection didn't keep its own env")
-    if "subvalue" in parent_check.stdout:
-        failures.append("parent connection saw subagent's env (no isolation!)")
-    if second_dir not in sub_check.stdout or work_dir not in parent_check.stdout:
-        failures.append(
-            f"cwd isolation broken: parent={parent_check.stdout!r} sub={sub_check.stdout!r}"
+        step("remote_run command, failure, and persistent state")
+        result = await self.require_ok(
+            "remote_run", connection_id=main_id, cmd="hostname && pwd"
         )
-    else:
-        print(f"isolation OK: parent in {work_dir}, sub in {second_dir}")
+        self.require(
+            result["exit_code"] == 0 and bool(result["stdout"].strip()),
+            f"hostname/pwd failed: {result!r}",
+        )
+        result = await self.require_ok("remote_run", connection_id=main_id, cmd="false")
+        self.require(result["exit_code"] == 1, f"false returned {result!r}")
+        await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd=(f"cd {shlex.quote(self.primary_dir)} && export RSM_SMOKE_STATE=kept"),
+        )
+        result = await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd='pwd; printf "state=%s\\n" "$RSM_SMOKE_STATE"',
+        )
+        self.require(
+            self.primary_dir in result["stdout"] and "state=kept" in result["stdout"],
+            f"shell state did not persist: {result!r}",
+        )
 
-    step("connect with bad project_path → cwd_warning distinguishes rc≠0 from timeout")
-    bad = await sm.connect(host=host, project_path=missing_dir)
-    if bad.cwd_warning is None:
-        failures.append("expected cwd_warning for bad project_path, got None")
-    elif "rc=" not in bad.cwd_warning or "doesn't exist" not in bad.cwd_warning:
-        failures.append(
-            f"cwd_warning should describe a path-not-found (rc=...), got:\n{bad.cwd_warning!r}"
+        step("remote_run multiline program and heredoc")
+        result = await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd=(
+                "for i in 1 2 3 4 5; do\n"
+                "  echo line$i\n"
+                "done\n"
+                "cat <<'RSM_HEREDOC'\n"
+                "literal:$HOME\n"
+                "RSM_HEREDOC\n"
+            ),
         )
-    elif "timed out" in bad.cwd_warning:
-        failures.append(
-            "cwd_warning should NOT mention timeout for a real cd-failure case"
+        expected_lines = [f"line{i}" for i in range(1, 6)] + ["literal:$HOME"]
+        self.require(
+            result["stdout"].splitlines() == expected_lines,
+            f"multiline output mismatch: {result!r}",
         )
-    elif bad.cwd == "?" or bad.cwd == missing_dir:
-        failures.append(
-            f"cwd should be the actual fallback (likely $HOME), got {bad.cwd!r}"
-        )
-    else:
-        print(
-            f"cwd_warning correctly identifies path-not-found; cwd fell back to {bad.cwd}"
-        )
-    await sm.disconnect(bad.connection_id)
 
-    step("stress: 20 rapid back-to-back small writes (sentinel-race regression)")
-    # The v0.1.2 race manifested when capture-pane saw END before BEGIN had
-    # propagated — most likely on the first write after a fresh window, but
-    # any rapid sequence increases the chance of catching it.
-    stress_failures = 0
-    for i in range(20):
-        try:
-            stress_path = remote_path(work_dir, f"rsm_stress_{i}.txt")
-            await write_remote_file(
-                conn.pane_id, stress_path, f"payload-{i}\n".encode()
+        step("remote_write and remote_read small UTF-8 text")
+        text_path = remote_path(self.primary_dir, "text.txt")
+        text = "Hello, remote!\nLine 2 with ✨ unicode\nLine 3\n"
+        written = await self.require_ok(
+            "remote_write", connection_id=main_id, path=text_path, content=text
+        )
+        self.require(
+            written["bytes_written"] == len(text.encode()),
+            f"small write length mismatch: {written!r}",
+        )
+        read = await self.require_ok(
+            "remote_read", connection_id=main_id, path=text_path
+        )
+        self.require(read["content"] == text, f"small read mismatch: {read!r}")
+
+        step("remote_write 5 MB UTF-8 text and remote_read it in chunks")
+        prefix = "✨ remote write start\n"
+        suffix = "\nremote write end ✨\n"
+        middle_bytes = LARGE_WRITE_BYTES - len(prefix.encode()) - len(suffix.encode())
+        large_text = prefix + ("x" * middle_bytes) + suffix
+        self.require(
+            len(large_text.encode()) == LARGE_WRITE_BYTES,
+            "large payload construction produced the wrong byte length",
+        )
+        large_path = remote_path(self.primary_dir, "large.txt")
+        written = await self.require_ok(
+            "remote_write", connection_id=main_id, path=large_path, content=large_text
+        )
+        self.require(
+            written["bytes_written"] == LARGE_WRITE_BYTES,
+            f"large write length mismatch: {written!r}",
+        )
+        chunks: list[str] = []
+        offset = 0
+        while offset < LARGE_WRITE_BYTES:
+            chunk = await self.require_ok(
+                "remote_read",
+                connection_id=main_id,
+                path=large_path,
+                offset=offset,
+                limit=READ_CHUNK_BYTES,
             )
-            data, _ = await read_remote_file(conn.pane_id, stress_path)
-            if data != f"payload-{i}\n".encode():
-                stress_failures += 1
-        except Exception as e:
-            stress_failures += 1
-            print(f"  iteration {i}: {type(e).__name__}: {str(e)[:120]}")
-    if stress_failures:
-        failures.append(f"{stress_failures}/20 stress iterations failed")
-    else:
-        print("stress OK (20/20 round-trips passed)")
+            self.require(
+                chunk.get("encoding_warning") is None,
+                f"large UTF-8 read split an encoded character: {chunk!r}",
+            )
+            self.require(
+                chunk["total_size"] == LARGE_WRITE_BYTES,
+                f"large read reported the wrong size: {chunk!r}",
+            )
+            byte_size = chunk["byte_size"]
+            self.require(byte_size > 0, f"large read made no progress at {offset}")
+            chunks.append(chunk["content"])
+            offset += byte_size
+        self.require("".join(chunks) == large_text, "large chunked read mismatch")
 
-    step("multi-line cmd works through remote_run via server.py")
-    # FastMCP exposes the underlying tool function via `.fn` on newer versions
-    # and as the bare function on older versions; cope with both.
-    from remote_ssh_mcp import server as server_module
-    from remote_ssh_mcp.server import remote_run as _rr
+        step("remote_edit exact and replace-all behavior")
+        await self.require_ok(
+            "remote_write",
+            connection_id=main_id,
+            path=text_path,
+            content="alpha\nbravo\ncharlie\n",
+        )
+        edited = await self.require_ok(
+            "remote_edit",
+            connection_id=main_id,
+            path=text_path,
+            old="bravo",
+            new="DELTA",
+        )
+        self.require(edited["occurrences_replaced"] == 1, repr(edited))
+        await self.require_ok(
+            "remote_write", connection_id=main_id, path=text_path, content="x x x\n"
+        )
+        rejected = await self.call(
+            "remote_edit",
+            connection_id=main_id,
+            path=text_path,
+            old="x",
+            new="Y",
+        )
+        self.require(
+            rejected.get("ok") is False and "not unique" in rejected.get("error", ""),
+            f"non-unique edit was not rejected: {rejected!r}",
+        )
+        edited = await self.require_ok(
+            "remote_edit",
+            connection_id=main_id,
+            path=text_path,
+            old="x",
+            new="Y",
+            replace_all=True,
+        )
+        self.require(edited["occurrences_replaced"] == 3, repr(edited))
 
-    server_module.sessions = sm
-    rr_callable = getattr(_rr, "fn", _rr)
-    res = await rr_callable(
-        connection_id=conn.connection_id,
-        cmd="export RSM_MULTILINE_SMOKE=kept\necho first\necho second\nfalse\n",
-    )
-    if (
-        res.get("ok") is not True
-        or res.get("stdout", "").splitlines() != ["first", "second"]
-        or res.get("exit_code") != 1
-    ):
-        failures.append(f"expected successful multi-line execution, got {res!r}")
-    else:
-        state = await run_in_pane(conn.pane_id, 'echo "$RSM_MULTILINE_SMOKE"')
-        if state.stdout.strip() != "kept":
-            failures.append("multi-line command did not preserve exported state")
-        else:
-            print("multi-line cmd and state persistence OK")
+        step("remote_run bounded long output")
+        result = await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd="for i in $(seq 1 1000); do echo line$i; done",
+        )
+        lines = result["stdout"].splitlines()
+        self.require(
+            len(lines) == 1000 and lines[0] == "line1" and lines[-1] == "line1000",
+            f"long output mismatch: {len(lines)} lines",
+        )
 
-    step("disconnect (sub then main)")
-    await sm.disconnect(sub.connection_id)
-    info = await sm.disconnect(conn.connection_id)
-    print(info)
+        step("remote_grep and remote_glob exact truncation")
+        for name in ("grep-a.txt", "grep-b.txt"):
+            await self.require_ok(
+                "remote_write",
+                connection_id=main_id,
+                path=remote_path(self.primary_dir, name),
+                content=f"{name}\nNEEDLE_42\n",
+            )
+        grep = await self.require_ok(
+            "remote_grep",
+            connection_id=main_id,
+            pattern="NEEDLE_42",
+            path=self.primary_dir,
+            max_results=1,
+        )
+        self.require(
+            grep["count"] == 1 and grep["truncated"] is True,
+            f"grep truncation mismatch: {grep!r}",
+        )
+        glob = await self.require_ok(
+            "remote_glob",
+            connection_id=main_id,
+            pattern="grep-*.txt",
+            path=self.primary_dir,
+            max_results=1,
+        )
+        self.require(
+            glob["count"] == 1 and glob["truncated"] is True,
+            f"glob truncation mismatch: {glob!r}",
+        )
 
-    print("\n" + "=" * 50)
-    if failures:
-        print(f"FAILURES: {len(failures)}")
-        for f in failures:
-            print(f"  - {f}")
+        step("connection isolation and status")
+        secondary = await self.connect(self.second_dir, f"{self.run_id}-second")
+        secondary_id = secondary["connection_id"]
+        self.require(
+            secondary.get("cwd_warning") is None,
+            repr(secondary.get("cwd_warning")),
+        )
+        await self.require_ok(
+            "remote_run",
+            connection_id=secondary_id,
+            cmd=(
+                f"cd {shlex.quote(self.secondary_dir)} && "
+                "export RSM_SECONDARY_STATE=isolated"
+            ),
+        )
+        parent = await self.require_ok(
+            "remote_run",
+            connection_id=main_id,
+            cmd='printf "secondary=%s cwd=%s\\n" "$RSM_SECONDARY_STATE" "$PWD"',
+        )
+        child = await self.require_ok(
+            "remote_run",
+            connection_id=secondary_id,
+            cmd='printf "secondary=%s cwd=%s\\n" "$RSM_SECONDARY_STATE" "$PWD"',
+        )
+        self.require("isolated" not in parent["stdout"], repr(parent))
+        self.require(
+            "isolated" in child["stdout"] and self.secondary_dir in child["stdout"],
+            repr(child),
+        )
+        status = await self.require_ok("remote_status")
+        active_ids = {item["connection_id"] for item in status["connections"]}
+        self.require(
+            {main_id, secondary_id}.issubset(active_ids),
+            f"status omitted active connections: {status!r}",
+        )
+
+        step("bad project path warning")
+        bad = await self.connect(self.missing_dir, f"{self.run_id}-missing")
+        warning = bad.get("cwd_warning")
+        self.require(
+            isinstance(warning, str)
+            and "rc=" in warning
+            and "doesn't exist" in warning
+            and "timed out" not in warning,
+            f"bad project path warning mismatch: {bad!r}",
+        )
+
+        step("20 rapid public write/read round-trips")
+        for index in range(20):
+            path = remote_path(self.primary_dir, f"stress-{index}.txt")
+            content = f"payload-{index}\n"
+            await self.require_ok(
+                "remote_write",
+                connection_id=main_id,
+                path=path,
+                content=content,
+            )
+            read = await self.require_ok(
+                "remote_read", connection_id=main_id, path=path
+            )
+            self.require(read["content"] == content, f"stress mismatch at {index}")
+
+    async def cleanup(self) -> None:
+        step("verified cleanup")
+        cleanup_id: str | None = None
+        try:
+            cleanup = await self.connect(self.work_dir, f"{self.run_id}-cleanup")
+            cleanup_id = cleanup["connection_id"]
+        except Exception as exc:
+            self.cleanup_failures.append(f"could not open cleanup connection: {exc}")
+            if self.connection_ids:
+                cleanup_id = self.connection_ids[0]
+
+        if cleanup_id is not None:
+            cleanup_command = (
+                f"cd {shlex.quote(self.work_dir)} && rm -rf -- "
+                f"{shlex.quote(self.primary_dir)} {shlex.quote(self.secondary_dir)}"
+            )
+            try:
+                result = await self.require_ok(
+                    "remote_run",
+                    connection_id=cleanup_id,
+                    cmd=cleanup_command,
+                    timeout=120,
+                )
+                if result.get("exit_code") != 0:
+                    self.cleanup_failures.append(f"cleanup command failed: {result!r}")
+
+                paths_json = json.dumps(
+                    [self.primary_dir, self.secondary_dir], ensure_ascii=False
+                )
+                verify_code = (
+                    "import json,os,sys;"
+                    f"paths=json.loads({paths_json!r});"
+                    "remaining=[p for p in paths if os.path.lexists(p)];"
+                    "print('cleanup-verified' if not remaining else repr(remaining));"
+                    "sys.exit(bool(remaining))"
+                )
+                verified = await self.require_ok(
+                    "remote_run",
+                    connection_id=cleanup_id,
+                    cmd=f"python3 -c {shlex.quote(verify_code)}",
+                )
+                if (
+                    verified.get("exit_code") != 0
+                    or verified.get("stdout", "").strip() != "cleanup-verified"
+                ):
+                    self.cleanup_failures.append(
+                        f"remote paths remain after cleanup: {verified!r}"
+                    )
+            except Exception as exc:
+                self.cleanup_failures.append(f"remote cleanup failed: {exc}")
+
+        for connection_id in reversed(self.connection_ids.copy()):
+            try:
+                result = await self.call(
+                    "remote_disconnect", connection_id=connection_id
+                )
+                if result.get("ok") is not True:
+                    self.cleanup_failures.append(
+                        f"disconnect {connection_id} failed: {result!r}"
+                    )
+            except Exception as exc:
+                self.cleanup_failures.append(
+                    f"disconnect {connection_id} raised: {exc}"
+                )
+
+        try:
+            status = await self.require_ok("remote_status")
+            if status["connections"]:
+                self.cleanup_failures.append(
+                    f"connections remain after cleanup: {status['connections']!r}"
+                )
+        except Exception as exc:
+            self.cleanup_failures.append(f"could not verify connection cleanup: {exc}")
+
+
+async def main(host: str, work_dir: str, second_dir: str, missing_dir: str) -> int:
+    server.sessions = SessionManager()
+    harness = SmokeHarness(host, work_dir, second_dir, missing_dir)
+    failure: str | None = None
+    try:
+        await harness.run()
+    except Exception as exc:
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        await harness.cleanup()
+
+    if failure is not None:
+        print(f"\nSMOKE FAILURE: {failure}")
+    if harness.cleanup_failures:
+        print("\nCLEANUP FAILURES:")
+        for cleanup_failure in harness.cleanup_failures:
+            print(f"  - {cleanup_failure}")
+    if failure is not None or harness.cleanup_failures:
         return 1
-    print("ALL CHECKS PASSED")
+
+    print("\nALL CHECKS PASSED; CLEANUP VERIFIED")
     return 0
 
 

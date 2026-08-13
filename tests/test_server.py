@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from importlib.metadata import version as distribution_version
 from types import SimpleNamespace
 
 import pytest
@@ -36,6 +37,35 @@ async def test_mcp_registers_expected_tools() -> None:
         "remote_status",
         "remote_write",
     }
+
+
+@pytest.mark.asyncio
+async def test_tool_descriptions_are_general_and_semantic() -> None:
+    tools = {tool.name: tool.description for tool in await server.mcp.list_tools()}
+
+    assert tools["remote_connect"] == (
+        "Open a persistent SSH connection for a host and optional project path."
+    )
+    assert tools["remote_disconnect"] == "Close an active remote connection."
+    assert tools["remote_grep"] == (
+        "Search remote files for a text pattern and return matching lines."
+    )
+
+
+def test_cli_version_exits_without_starting_server(capsys, monkeypatch) -> None:
+    monkeypatch.setattr(
+        server.mcp,
+        "run",
+        lambda: pytest.fail("the MCP server must not start for --version"),
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        server.main(["--version"])
+
+    assert exc_info.value.code == 0
+    assert capsys.readouterr().out.strip() == (
+        f"remote-ssh-mcp {distribution_version('remote-ssh-mcp')}"
+    )
 
 
 @pytest.mark.asyncio

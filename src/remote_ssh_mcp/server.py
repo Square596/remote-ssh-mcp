@@ -3,7 +3,9 @@ SessionManager / runner / files modules."""
 
 from __future__ import annotations
 
-from typing import Optional
+import argparse
+from importlib.metadata import version as distribution_version
+from typing import Optional, Sequence
 
 from ._mcp_compat import MCPServer, tool
 from .contracts import (
@@ -105,10 +107,7 @@ async def remote_connect(
     agent_forwarding: bool = True,
     ssh_add_paths: Optional[list[str]] = None,
 ) -> ConnectResponse:
-    """Open a fresh tmux+SSH window for a host and optional project path.
-    Returns a `connection_id`, cwd, attach hint, and SSH agent status. If
-    `cwd_warning` is set, stop and ask for the correct path before working.
-    """
+    """Open a persistent SSH connection for a host and optional project path."""
     try:
         conn = await sessions.connect(
             host=host,
@@ -145,7 +144,7 @@ async def remote_connect(
     open_world=False,
 )
 async def remote_disconnect(connection_id: str) -> DisconnectResponse:
-    """Close this connection's tmux window."""
+    """Close an active remote connection."""
     try:
         info = await sessions.disconnect(connection_id)
     except SessionError as exc:
@@ -346,7 +345,7 @@ async def remote_grep(
     case_insensitive: bool = False,
     max_results: int = 200,
 ) -> GrepResponse:
-    """Search remote files with ripgrep or grep fallback."""
+    """Search remote files for a text pattern and return matching lines."""
     for name, value, allow_empty in (
         ("pattern", pattern, True),
         ("path", path, False),
@@ -441,8 +440,15 @@ async def remote_glob(
     )
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> None:
     """Entry point for the `remote-ssh-mcp` console script."""
+    parser = argparse.ArgumentParser(prog="remote-ssh-mcp")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {distribution_version('remote-ssh-mcp')}",
+    )
+    parser.parse_args(argv)
     mcp.run()
 
 

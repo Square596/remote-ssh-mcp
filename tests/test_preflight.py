@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from remote_ssh_mcp.preflight import PreflightError, communicate_process
 from remote_ssh_mcp.session import PreflightResult, SessionError, SessionManager
 
 
@@ -54,7 +55,7 @@ def install_process_mock(
         return results.pop(0)
 
     monkeypatch.setattr(
-        "remote_ssh_mcp.session.asyncio.create_subprocess_exec",
+        "remote_ssh_mcp.preflight.asyncio.create_subprocess_exec",
         fake_create_subprocess_exec,
     )
     return calls
@@ -216,10 +217,8 @@ async def test_preflight_can_disable_agent_forwarding(monkeypatch, ssh_host):
 async def test_local_ssh_timeout_kills_and_reaps_subprocess() -> None:
     proc = HangingProc()
 
-    with pytest.raises(SessionError, match="timed out"):
-        await SessionManager()._communicate_process(
-            proc, timeout=0.001, description="test process"
-        )
+    with pytest.raises(PreflightError, match="timed out"):
+        await communicate_process(proc, timeout=0.001, description="test process")
 
     assert proc.killed is True
     assert proc.waited is True
@@ -229,9 +228,7 @@ async def test_local_ssh_timeout_kills_and_reaps_subprocess() -> None:
 async def test_local_ssh_cancellation_kills_and_reaps_subprocess() -> None:
     proc = HangingProc()
     task = asyncio.create_task(
-        SessionManager()._communicate_process(
-            proc, timeout=30, description="test process"
-        )
+        communicate_process(proc, timeout=30, description="test process")
     )
     await asyncio.sleep(0)
     task.cancel()

@@ -66,6 +66,11 @@ That keeps Codex, Claude, Cursor, and other MCP clients on the latest GitHub
 version when they start a new session. Startup depends on GitHub/network
 availability.
 
+An already-running MCP process does not hot-reload after an upgrade. Restart
+the MCP client or begin a new client session to load the updated server. Run
+`remote-ssh-mcp --version` to see which version a newly launched process will
+use.
+
 ### Repository plugin layout
 
 This repository carries both Claude Code and Codex plugin metadata:
