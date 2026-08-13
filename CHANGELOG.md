@@ -4,8 +4,8 @@ Notable changes to remote-ssh-mcp are recorded here.
 
 ## 0.4.2 - 2026-08-13
 
-- Keep timed-out command output current and free of internal tmux framing,
-  pane history, and inherited shell-trace diagnostics.
+- Keep timed-out command output current and free of internal tmux framing and
+  pane history.
 
 ## 0.4.1 - 2026-08-13
 

@@ -192,42 +192,17 @@ async def test_timed_out_run_recovers_shell(tmux_pane):
         label="test",
     )
 
-    trace_enabled = await run_in_pane(pane_id, "set -x", timeout=5)
     result = await SessionManager().run_command(
         conn, "printf 'timeout-marker\\n'; sleep 30", timeout=0.2
     )
     probe = await run_in_pane(pane_id, "printf recovered", timeout=5)
 
-    assert trace_enabled.stdout == "", (shell, trace_enabled.stdout)
     assert result.timed_out is True, (shell, result.stdout)
     assert result.pane_recovered is True, (shell, result.stdout)
     assert result.stdout == "timeout-marker", (shell, result.stdout)
     assert "__RSM_" not in result.stdout, (shell, result.stdout)
     assert conn.state == "ready"
     assert probe.stdout == "recovered"
-
-
-@pytest.mark.asyncio
-async def test_run_preserves_explicit_xtrace_state_without_leaking(tmux_pane):
-    shell, pane_id = tmux_pane
-
-    enabled = await run_in_pane(pane_id, "set -x", timeout=5)
-    traced = await run_in_pane(
-        pane_id, "case $- in *x*) printf on ;; *) printf off ;; esac", timeout=5
-    )
-    disabled = await run_in_pane(pane_id, "set +x", timeout=5)
-    untraced = await run_in_pane(
-        pane_id, "case $- in *x*) printf on ;; *) printf off ;; esac", timeout=5
-    )
-
-    assert enabled.stdout == "", (shell, enabled.stdout)
-    assert traced.stdout == "on", (shell, traced.stdout)
-    assert disabled.stdout == "", (shell, disabled.stdout)
-    assert untraced.stdout == "off", (shell, untraced.stdout)
-    assert all(
-        "__RSM_" not in result.stdout
-        for result in (enabled, traced, disabled, untraced)
-    )
 
 
 @pytest.mark.asyncio

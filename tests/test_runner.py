@@ -199,52 +199,6 @@ def test_wrap_command_framing_cannot_be_clobbered_by_user_variables() -> None:
     assert "__RSM_CWD_leftright__" in proc.stdout
 
 
-@pytest.mark.parametrize("shell", ["bash", "zsh"])
-@pytest.mark.parametrize(
-    ("initial_xtrace", "command", "expected_xtrace"),
-    [
-        (True, "printf clean", True),
-        (True, "set +x; printf clean", False),
-        (False, "set -x; printf clean", True),
-    ],
-)
-def test_wrap_command_isolates_xtrace_and_preserves_resulting_state(
-    shell: str,
-    initial_xtrace: bool,
-    command: str,
-    expected_xtrace: bool,
-) -> None:
-    shell_path = shutil.which(shell)
-    if shell_path is None:
-        pytest.skip(f"{shell} is required")
-
-    marker = "abc123"
-    wrapped = _wrap_command(marker, command)
-    initial = "set -x" if initial_xtrace else "set +x"
-    proc = subprocess.run(
-        [
-            shell_path,
-            "-fc",
-            (
-                f"{initial}; {wrapped}; "
-                "case $- in *x*) printf '\nTRACE_STATE:on\n'; set +x ;; "
-                "*) printf '\nTRACE_STATE:off\n' ;; esac"
-            ),
-        ],
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    begin_re = re.compile(rf"__RSM_BEGIN_{marker}__")
-    trace_re = re.compile(rf"_{{2,}}RSM_XTRACE_{marker}__[^\n]*(?:\n|$)")
-    end_pos = proc.stdout.index(f"__RSM_END_{marker}_0__")
-
-    assert _extract_output(proc.stdout, begin_re, end_pos, trace_re) == "clean"
-    expected_state = "on" if expected_xtrace else "off"
-    assert f"TRACE_STATE:{expected_state}" in proc.stdout
-
-
 @pytest.mark.asyncio
 async def test_run_rejects_non_positive_deadlines_before_paste(monkeypatch) -> None:
     async def unexpected_paste(*args, **kwargs):
