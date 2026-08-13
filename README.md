@@ -30,8 +30,8 @@ You can `tmux attach -t remote-ssh-mcp/<host>` at any time to watch.
 
 Alpha. The current release ships with explicit connection lifecycle state,
 automatic pane recovery after command timeouts, single-window-per-connection
-serialization, and 1 MB caps on individual command responses and file reads.
-See [Limitations](#limitations).
+serialization, typed tool responses on modern MCP clients, and 1 MB caps on
+individual command responses and file reads. See [Limitations](#limitations).
 
 ## Install
 
@@ -105,7 +105,7 @@ the auto-updating stdio server directly:
       "command": "sh",
       "args": [
         "-lc",
-        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade --with 'mcp<2' git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
+        "command -v uv >/dev/null 2>&1 || { echo 'remote-ssh-mcp plugin requires uv in PATH for auto-install. Install uv, or preinstall remote-ssh-mcp and configure your MCP client to run command: remote-ssh-mcp.' >&2; exit 127; }; uv tool install --quiet --upgrade --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp >&2; exec \"$(uv tool dir --bin)/remote-ssh-mcp\""
       ],
       "env_vars": ["SSH_AUTH_SOCK"]
     }
@@ -120,19 +120,18 @@ itself to be launched from an environment where `SSH_AUTH_SOCK` is set.
 You can also install the Python package directly as a stable uv-managed tool:
 
 ```bash
-uv tool install --with 'mcp<2' git+https://github.com/Square596/remote-ssh-mcp
+uv tool install --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp
 ```
 
-The bundled and recommended install commands currently select the mature MCP
-SDK 1.x line. The server also supports MCP SDK 2.x. To opt in, use the manual
-MCP server configuration below and install with:
+The bundled and recommended install commands select MCP SDK 2.x. The server
+also supports MCP SDK 1.x back to 1.2. To use the older SDK line, install with:
 
 ```bash
-uv tool install --reinstall --with 'mcp>=2,<3' git+https://github.com/Square596/remote-ssh-mcp
+uv tool install --reinstall --with 'mcp>=1.2,<2' git+https://github.com/Square596/remote-ssh-mcp
 ```
 
-Do not combine this opt-in with the bundled auto-updating configuration, which
-deliberately restores the SDK 1.x constraint on startup.
+Do not combine that fallback with the bundled auto-updating configuration,
+which restores the recommended SDK 2.x constraint on startup.
 
 Then add the installed command to your MCP client config:
 
@@ -217,8 +216,8 @@ All file/exec tools take a `connection_id` returned by `remote_connect`.
 | `remote_read(connection_id, path, offset?, limit?)` | Read | Returns up to 1 MB of text; flags chunks containing invalid UTF-8. |
 | `remote_write(connection_id, path, content)` | Write | Atomically writes UTF-8 text after transport verification; preserves existing modes and symlinks. |
 | `remote_edit(connection_id, path, old, new, replace_all?)` | Edit | Exact single- or multi-line match; errors if `old` is non-unique unless `replace_all=true`. |
-| `remote_grep(connection_id, pattern, path?, glob?)` | Grep | Uses `rg` if available, else `grep -r`. |
-| `remote_glob(connection_id, pattern, path?)` | Glob | Uses `find`. |
+| `remote_grep(connection_id, pattern, path?, glob?)` | Grep | Uses `rg` if available, else `grep -r`; reports failures and exact truncation. |
+| `remote_glob(connection_id, pattern, path?)` | Glob | Walks files with remote Python; reports failures and exact truncation. |
 
 ## Troubleshooting
 
@@ -266,6 +265,8 @@ to your window. Check the parent's prompt to subagents.
   or `nohup … &` for true background work.
 - **Single `remote_run` responses are capped at 1 MB.** When output is larger,
   the response preserves its beginning and end and sets `truncated=true`.
+- **Limits are bounded.** `remote_run` timeouts range from 1 second to 24 hours;
+  grep and glob requests accept from 1 to 10,000 results.
 - **Single `remote_read` calls are capped at ~1 MB.** Read larger files in
   chunks with `offset` and `limit`; `remote_edit` chunks internally for UTF-8
   text files.
@@ -279,6 +280,13 @@ to your window. Check the parent's prompt to subagents.
   encode their string inputs as UTF-8. `remote_read` replaces invalid UTF-8
   bytes and adds `encoding_warning`. Use `scp`/`rsync` or a binary-safe
   `remote_run` command when exact binary bytes matter.
+
+## Development
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for local checks and
+[docs/releasing.md](./docs/releasing.md) for the release checklist. Changes are
+recorded in [CHANGELOG.md](./CHANGELOG.md), and vulnerabilities should be
+reported as described in [SECURITY.md](./SECURITY.md).
 
 ## License
 
